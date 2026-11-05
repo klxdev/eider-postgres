@@ -1,0 +1,30 @@
+scram_user: connected as Text("scram_user")
+md5_user: connected as Text("md5_user")
+pw_user: connected as Text("pw_user")
+trust_user: connected as Text("trust_user")
+eider: connected as Text("eider")
+scram_user: Auth 28P01 password authentication failed for user "scram_user"
+md5_user: Auth 28P01 password authentication failed for user "md5_user"
+pw_user: Auth 28P01 password authentication failed for user "pw_user"
+scram_user: Auth  the server asks for a password and none was given
+md5_user: Auth  the server asks for a password and none was given
+nobody: Auth 28P01 password authentication failed for user "nobody"
+scram_user: Auth 28P01 password authentication failed for user "scram_user"
+missing database: Server 3D000
+refused: Io
+unresolvable: Io
+prefer without server TLS: connected, encrypted false
+Require without server TLS: Tls: the server does not support TLS
+VerifyFull without server TLS: Tls: the server does not support TLS
+application_name Text("eider-pg-test-app") search_path Text("pg_catalog")
+url: user u@x password Some("p:w/d") host db.example.org port 6543 db my db
+url: VerifyFull app app timeout 7000 params [("search_path", "a,b")]
+url error postgres: the URL has no user
+url bare: host localhost port 5432 user me db me password None
+mysql://x@y/z: BadConfig
+postgres://@h/d: BadConfig
+postgres://u@h:99999/d: BadConfig
+postgres://u@h:abc/d: BadConfig
+postgres://u@h/d?sslmode=maybe: BadConfig
+postgres://u%zz@h/d: BadConfig
+postgres://u@[::1/d: BadConfig

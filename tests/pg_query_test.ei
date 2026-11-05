@@ -1,0 +1,153 @@
+// Queries against a real server: parameters, NULLs, the statement cache, errors with their
+// fields, several statements, empty results, many rows, the notices.
+
+import postgres
+import postgres.client
+import postgres.codec
+import std.strings
+import std.time
+import postgres.tests.util
+
+fn show(rs: postgres.Rows) uses io {
+    print("columns: {rs.columns.len()} rows: {rs.rows.len()} tag: {rs.tag} affected: {rs.affected}")
+    let mut r: usize = 0
+    while r < rs.rows.len() {
+        let mut line = String.from("")
+        let mut c: usize = 0
+        while c < rs.columns.len() {
+            if c > 0 { line.push_str(" | ") }
+            match codec.value(rs, r, c) {
+                Ok(v) => { line.append("{v}") }
+                Err(e) => { line.push_str("ERR") }
+            }
+            c += 1
+        }
+        print("  {line}")
+        r += 1
+    }
+}
+
+fn main() uses net, io, clock, fs {
+    let mut c = util.admin()
+    let dl = util.dl()
+    print("usable: {c.usable()} in tx: {c.in_transaction()} encrypted: {c.encrypted()}")
+    print("version ok: {c.server_version().len() > 0}")
+    match c.parameter("client_encoding") {
+        Some(v) => print("client_encoding {v}")
+        None => print("no client_encoding")
+    }
+
+    // parameters of every kind
+    let ps = List[postgres.Int(41), postgres.Text(String.from("héllo")), postgres.Bool(true), postgres.Float(2.5), postgres.Null, postgres.Bytes("abc".bytes())]
+    show(c.query("SELECT $1::int8 + 1 AS n, $2::text AS t, $3::bool AS b, $4::float8 AS f, $5::int AS z, $6::bytea AS by", ps, dl).unwrap())
+    // the server settles the parameter types from context
+    show(c.query("SELECT $1 + 1 AS n", List[postgres.Int(1)], dl).unwrap())
+    show(c.query("SELECT $1::int AS n", List[postgres.Text(String.from("12"))], dl).unwrap())
+    show(c.query("SELECT $1::numeric AS n, $2::uuid AS u, $3::date AS d, $4::timestamptz AS t", List[postgres.Text(String.from("12.5")), postgres.Text(String.from("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")), postgres.Text(String.from("2026-11-05")), postgres.Text(String.from("2026-11-05 13:45:01+00"))], dl).unwrap())
+    show(c.query("SELECT $1::int[] AS a", List[postgres.Array(List[postgres.Int(1), postgres.Null, postgres.Int(3)])], dl).unwrap())
+
+    // a table
+    let z = c.execute("DROP TABLE IF EXISTS q_test", dl).unwrap()
+    let z2 = c.execute("CREATE TABLE q_test (id int PRIMARY KEY, name text NOT NULL, score float8, born date)", dl).unwrap()
+    let ins = "INSERT INTO q_test VALUES ($1, $2, $3, $4)"
+    let n1 = c.exec(ins, List[postgres.Int(1), postgres.Text(String.from("ada")), postgres.Float(9.5), postgres.Date(codec_date())], dl).unwrap()
+    print("insert: {n1}")
+    let n2 = c.exec(ins, List[postgres.Int(2), postgres.Text(String.from("bob")), postgres.Null, postgres.Null], dl).unwrap()
+    print("insert: {n2}")
+    show(c.query("SELECT * FROM q_test ORDER BY id", List.new(), dl).unwrap())
+    let n3 = c.exec("UPDATE q_test SET score = score + 1 WHERE score IS NOT NULL", List.new(), dl).unwrap()
+    print("update: {n3}")
+    let n4 = c.exec("DELETE FROM q_test WHERE id = $1", List[postgres.Int(99)], dl).unwrap()
+    print("delete none: {n4}")
+
+    // the statement cache: the same statement text twice is parsed once
+    let before = c.cached_statements()
+    let q = "SELECT name FROM q_test WHERE id = $1"
+    let a = c.query(q, List[postgres.Int(1)], dl).unwrap()
+    let b = c.query(q, List[postgres.Int(2)], dl).unwrap()
+    print("cache grew by {c.cached_statements() - before}, results {a.rows.len()} {b.rows.len()}")
+    let p = c.prepare("SELECT id, name FROM q_test WHERE id > $1 AND name <> $2", dl).unwrap()
+    print("prepared: params {p.param_oids} columns {p.columns.len()}")
+
+    // errors carry the server's fields
+    match c.query("INSERT INTO q_test VALUES (1, 'dup', 0, NULL)", List.new(), dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => {
+            print("kind {e.kind} state {e.sqlstate} class {e.class()} severity {e.severity}")
+            print("message: {e.message}")
+            print("detail: {e.detail}")
+            print("constraint {e.constraint} table {e.table} schema {e.schema}")
+            print("is unique violation: {e.is_state(postgres.UNIQUE_VIOLATION)} is constraint: {e.is_constraint()}")
+        }
+    }
+    print("usable after an error: {c.usable()}")
+    match c.query("SELEC 1", List.new(), dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => print("syntax: {e.sqlstate} position {e.position}: {e.message}")
+    }
+    match c.query("SELECT * FROM no_such_table", List.new(), dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => print("{postgres.error_text(e)}")
+    }
+    match c.query("SELECT 1 / $1::int", List[postgres.Int(0)], dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => print("{e.sqlstate} {e.message}")
+    }
+    match c.query("SELECT $1::int", List.new(), dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => print("wrong parameter count: {e.kind} {e.message}")
+    }
+    match c.query("SELECT $1::int", List[postgres.Text(String.from("x"))], dl) {
+        Ok(rs) => print("no error?")
+        Err(e) => print("bad text for an int: {e.sqlstate}")
+    }
+    show(c.query("SELECT 'still works' AS ok", List.new(), dl).unwrap())
+
+    // several statements through the simple protocol
+    let rs = c.simple("SELECT 1 AS a; SELECT 'two' AS b, 3 AS c; UPDATE q_test SET score = 0 WHERE id = 99", dl).unwrap()
+    print("statements: {rs.len()}")
+    for r in rs { show(r) }
+    let empty = c.simple("", dl).unwrap()
+    print("empty query: {empty.len()}")
+    match c.simple("SELECT 1; SELECT 1/0; SELECT 2", dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("second statement fails: {e.sqlstate}")
+    }
+    print("usable: {c.usable()}")
+
+    // notices
+    let n = c.execute("DO $$ BEGIN RAISE NOTICE 'hello from the server'; END $$", dl).unwrap()
+    for note in c.take_notices() { print("notice {note.severity}: {note.message}") }
+
+    // many rows, two columns
+    let big = c.query("SELECT g, 'row ' || g FROM generate_series(1, 20000) g", List.new(), dl).unwrap()
+    print("big: {big.rows.len()} last {codec.value(big, 19999, 1).unwrap()}")
+    // a wide row
+    let wide = c.query("SELECT repeat('x', 1000000) AS w", List.new(), dl).unwrap()
+    let wv = codec.value(wide, 0, 0).unwrap()
+    let want = postgres.Text(strings.repeat("x", 1000000))
+    print("wide: {wv == want}")
+
+    // the result size limit
+    var cfg = util.config("eider", "eider_pw")
+    cfg.max_result_bytes = 1000
+    let mut small = client.connect(cfg, dl).unwrap()
+    match small.query("SELECT repeat('x', 5000)", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("too big: {e.kind} {e.message}")
+    }
+    print("still usable: {small.usable()}")
+    show(small.query("SELECT 1", List.new(), dl).unwrap())
+    small.close()
+    let z3 = c.execute("DROP TABLE q_test", dl).unwrap()
+    c.close()
+    print("closed: {c.usable()}")
+    match c.query("SELECT 1", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("after close: {e.kind}")
+    }
+}
+
+fn codec_date() -> time.DateTime {
+    time.datetime(1815, 12, 10, 0, 0, 0, 0, 0).unwrap()
+}

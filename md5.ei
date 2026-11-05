@@ -1,0 +1,113 @@
+//! postgres.md5: MD5 (RFC 1321) and the `md5` password message of the protocol.
+//!
+//! MD5 is broken as a hash and weak as a password exchange; it is here because PostgreSQL
+//! servers can still be configured for it (`md5` in pg_hba.conf, or a password stored as an MD5
+//! hash). Use SCRAM-SHA-256 (`postgres.scram`), which every server since 10 has.
+
+import std.bytes
+import std.encoding
+import std.math
+
+fn rotl(x: u32, n: u32) -> u32 { (x << n) | (x >> (32 - n)) }
+
+fn shift(r: usize) -> u32 {
+    let q = r % 4
+    if r < 16 { return if q == 0 { 7 } else if q == 1 { 12 } else if q == 2 { 17 } else { 22 } }
+    if r < 32 { return if q == 0 { 5 } else if q == 1 { 9 } else if q == 2 { 14 } else { 20 } }
+    if r < 48 { return if q == 0 { 4 } else if q == 1 { 11 } else if q == 2 { 16 } else { 23 } }
+    if q == 0 { 6 } else if q == 1 { 10 } else if q == 2 { 15 } else { 21 }
+}
+
+/// floor(2^32 * abs(sin(i + 1))) for i in 0..64, as RFC 1321 defines the constants.
+fn constants() -> List[u32] {
+    let mut k: List[u32] = List.new()
+    let mut i: usize = 0
+    while i < 64 {
+        let x = ((i + 1) as f64).sin().abs() * 4294967296.0
+        k.push(x.floor() as u64 as u32)
+        i += 1
+    }
+    k
+}
+
+/// The MD5 digest (16 bytes) of `msg`.
+pub fn md5(msg: List[u8]) -> List[u8] {
+    let k = constants()
+    let mut a0: u32 = 1732584193
+    let mut b0: u32 = 4023233417
+    let mut c0: u32 = 2562383102
+    let mut d0: u32 = 271733878
+    let mut m = msg.copy()
+    let bits = (msg.len() as u64) * 8
+    m.push(128)
+    while m.len() % 64 != 56 { m.push(0) }
+    let mut i: u32 = 0
+    while i < 8 {
+        m.push(((bits >> ((i * 8) as u64)) & 255) as u8)
+        i += 1
+    }
+    let mut blk: usize = 0
+    while blk < m.len() {
+        let mut w = List.filled(0 as u32, 16)
+        let mut j: usize = 0
+        while j < 16 {
+            let p = blk + j * 4
+            w[j] = (m[p] as u32) | ((m[p + 1] as u32) << 8) | ((m[p + 2] as u32) << 16) | ((m[p + 3] as u32) << 24)
+            j += 1
+        }
+        let mut a = a0.copy()
+        let mut b = b0.copy()
+        let mut c = c0.copy()
+        let mut d = d0.copy()
+        let mut r: usize = 0
+        while r < 64 {
+            let mut f: u32 = 0
+            let mut g: usize = 0
+            if r < 16 {
+                f = (b & c) | ((~b) & d)
+                g = r
+            } else if r < 32 {
+                f = (d & b) | ((~d) & c)
+                g = (5 * r + 1) % 16
+            } else if r < 48 {
+                f = b ^ c ^ d
+                g = (3 * r + 5) % 16
+            } else {
+                f = c ^ (b | (~d))
+                g = (7 * r) % 16
+            }
+            let tmp = d.copy()
+            d = c.copy()
+            c = b.copy()
+            b = b +% rotl(a +% f +% k[r] +% w[g], shift(r))
+            a = tmp
+            r += 1
+        }
+        a0 = a0 +% a
+        b0 = b0 +% b
+        c0 = c0 +% c
+        d0 = d0 +% d
+        blk += 64
+    }
+    let mut out: List[u8] = List.new()
+    encoding.push_u32_le(inout out, a0)
+    encoding.push_u32_le(inout out, b0)
+    encoding.push_u32_le(inout out, c0)
+    encoding.push_u32_le(inout out, d0)
+    out
+}
+
+/// The lowercase hex of the MD5 of `msg`.
+pub fn md5_hex(msg: List[u8]) -> String { encoding.hex(md5(msg)) }
+
+/// The text of the PasswordMessage for AuthenticationMD5Password: `"md5"` followed by
+/// `hex(md5(hex(md5(password + user)) + salt))`.
+pub fn password_message(user: String, password: String, salt: List[u8]) -> List[u8] {
+    let mut inner = password.bytes()
+    inner.extend(user.bytes())
+    let mut outer = md5_hex(inner).bytes()
+    outer.extend(salt)
+    let mut out = "md5".bytes()
+    out.extend(md5_hex(outer).bytes())
+    out
+}

@@ -1,0 +1,638 @@
+//! postgres.codec: the text and binary forms of the types this client knows, as `Value`s.
+//!
+//! Reading: `decode(oid, binary, data)` turns a cell into a `Value`. The types: bool, int2,
+//! int4, int8, oid, float4, float8, text, varchar, bpchar, name, char, bytea, uuid, numeric (as
+//! the decimal text), json, jsonb, date, timestamp, timestamptz, and arrays of them in the
+//! text form. A type it does not know comes back as `Raw` (never an error), so a query over
+//! other columns still works. A binary cell of a known type with the wrong size, a bad digit or
+//! a value out of range is a `Decode` error; nothing here traps on what a server sends.
+//!
+//! Writing: `param(v)` is the Bind parameter for a `Value`: integers, booleans, floats and
+//! bytes in binary with their type, everything else as text that the server parses (text, which
+//! takes its type from the statement). `result_binary(oid)` says which result columns to ask
+//! for in binary.
+
+import std.bytes
+import std.encoding
+import std.math
+import std.strings
+import std.time
+import std.utf8
+import postgres
+import postgres.wire
+
+fn dfail(m: str) -> postgres.Error { postgres.fail(postgres.Decode, m) }
+
+fn dfail_text(m: String) -> postgres.Error { postgres.error(postgres.Decode, m) }
+
+/// Whether a column of this type is requested in binary (a fixed-size or raw form that is
+/// cheaper than text and has no locale or style); the others are asked for as text.
+pub fn result_binary(oid: u32) -> bool {
+    if oid == postgres.OID_BOOL || oid == postgres.OID_BYTEA || oid == postgres.OID_INT8 || oid == postgres.OID_INT2 { return true }
+    if oid == postgres.OID_INT4 || oid == postgres.OID_OID || oid == postgres.OID_FLOAT4 || oid == postgres.OID_FLOAT8 { return true }
+    if oid == postgres.OID_UUID || oid == postgres.OID_DATE || oid == postgres.OID_TIMESTAMP || oid == postgres.OID_TIMESTAMPTZ { return true }
+    oid == postgres.OID_TEXT || oid == postgres.OID_VARCHAR
+}
+
+/// The element type of an array type this client reads, or 0.
+pub fn array_element(oid: u32) -> u32 {
+    if oid == 1000 { return postgres.OID_BOOL }
+    if oid == 1001 { return postgres.OID_BYTEA }
+    if oid == 1002 { return postgres.OID_CHAR }
+    if oid == 1003 { return postgres.OID_NAME }
+    if oid == 1005 { return postgres.OID_INT2 }
+    if oid == 1007 { return postgres.OID_INT4 }
+    if oid == 1009 { return postgres.OID_TEXT }
+    if oid == 1014 { return postgres.OID_BPCHAR }
+    if oid == 1015 { return postgres.OID_VARCHAR }
+    if oid == 1016 { return postgres.OID_INT8 }
+    if oid == 1021 { return postgres.OID_FLOAT4 }
+    if oid == 1022 { return postgres.OID_FLOAT8 }
+    if oid == 1028 { return postgres.OID_OID }
+    if oid == 1115 { return postgres.OID_TIMESTAMP }
+    if oid == 1182 { return postgres.OID_DATE }
+    if oid == 1185 { return postgres.OID_TIMESTAMPTZ }
+    if oid == 1231 { return postgres.OID_NUMERIC }
+    if oid == 2951 { return postgres.OID_UUID }
+    if oid == 199 { return postgres.OID_JSON }
+    if oid == 3807 { return postgres.OID_JSONB }
+    0
+}
+
+// ------------------------------------------------------------------------------------ helpers
+
+fn be_u64(b: List[u8]) -> u64 {
+    let mut v: u64 = 0
+    for x in b { v = (v << 8) | (x as u64) }
+    v
+}
+
+fn be_i64(b: List[u8]) -> i64 { encoding.signed64(be_u64(b)) }
+
+fn be_u32(b: List[u8]) -> u32 {
+    let mut v: u32 = 0
+    for x in b { v = (v << 8) | (x as u32) }
+    v
+}
+
+fn text(b: List[u8]) -> Result[String, postgres.Error] {
+    match String.from_bytes(b) {
+        Ok(s) => Ok(s)
+        Err(_) => Err(dfail("the cell is not valid UTF-8 text"))
+    }
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) { return q - 1 }
+    q
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    let r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { return r + b }
+    r
+}
+
+fn pad(n: i64, w: usize) -> String {
+    let mut s = String.from_int(n)
+    while s.len() < w {
+        let mut z = String.from("0")
+        z.append(s)
+        s = z
+    }
+    s
+}
+
+fn hex_digit(v: u8) -> u8 { if v < 10 { 48 + v } else { 87 + v } }
+
+// ------------------------------------------------------------------------------------- uuid
+
+fn uuid_text(b: List[u8]) -> String {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < 16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 { out.push(45) }
+        out.push(hex_digit(b[i] >> 4))
+        out.push(hex_digit(b[i] & 15))
+        i += 1
+    }
+    utf8.lossy(out)
+}
+
+// ----------------------------------------------------------------------------------- numeric
+
+/// The decimal text of a binary numeric: ndigits, weight, sign, dscale and base-10000 digits.
+fn numeric_binary(b: List[u8]) -> Result[String, postgres.Error] {
+    let mut r = wire.rd(b)
+    let nd = match wire.get_i16(inout r) {
+        Some(v) => v
+        None => { return Err(dfail("numeric: truncated")) }
+    }
+    let weight = match wire.get_i16(inout r) {
+        Some(v) => v
+        None => { return Err(dfail("numeric: truncated")) }
+    }
+    let sign = match wire.get_u16(inout r) {
+        Some(v) => v
+        None => { return Err(dfail("numeric: truncated")) }
+    }
+    let dscale = match wire.get_u16(inout r) {
+        Some(v) => v
+        None => { return Err(dfail("numeric: truncated")) }
+    }
+    if sign == 49152 { return Ok(String.from("NaN")) }
+    if sign == 53248 { return Ok(String.from("Infinity")) }
+    if sign == 61440 { return Ok(String.from("-Infinity")) }
+    if sign != 0 && sign != 16384 { return Err(dfail("numeric: bad sign")) }
+    if nd < 0 || (nd as usize) * 2 != wire.left(r) || dscale > 16383 { return Err(dfail("numeric: bad size")) }
+    if weight < -16384 || weight > 16383 { return Err(dfail("numeric: bad weight")) }
+    let mut digits: List[i32] = List.new()
+    let mut i: i32 = 0
+    while i < nd {
+        let d = match wire.get_i16(inout r) {
+            Some(v) => v
+            None => { return Err(dfail("numeric: truncated")) }
+        }
+        if d < 0 || d > 9999 { return Err(dfail("numeric: bad digit")) }
+        digits.push(d)
+        i += 1
+    }
+    let mut out: List[u8] = List.new()
+    if sign == 16384 { out.push(45) }
+    // integer part: groups weight down to 0
+    if weight < 0 {
+        out.push(48)
+    } else {
+        let mut g: i32 = 0
+        while g <= weight {
+            let d = if (g as usize) < digits.len() { digits[g as usize] } else { 0 }
+            let s = if g == 0 { String.from_int(d as i64) } else { pad(d as i64, 4) }
+            out.extend(s.bytes())
+            g += 1
+        }
+    }
+    if dscale > 0 {
+        out.push(46)
+        let mut frac: List[u8] = List.new()
+        // fractional groups: weight -1, -2, ...; group k (k >= 1) is digits[weight + k]
+        let mut k: i32 = 1
+        let want = (dscale as usize + 3) / 4
+        while (k as usize) <= want {
+            let idx = weight + k
+            let d = if idx >= 0 && (idx as usize) < digits.len() { digits[idx as usize] } else { 0 }
+            frac.extend(pad(d as i64, 4).bytes())
+            k += 1
+        }
+        out.extend(frac.slice(0, dscale as usize))
+    }
+    Ok(utf8.lossy(out))
+}
+
+// ------------------------------------------------------------------------------ date and time
+
+/// 2000-01-01 as days and seconds since 1970-01-01.
+const PG_EPOCH_DAYS: i64 = 10957
+const PG_EPOCH_SECS: i64 = 946684800
+
+fn date_of_days(days: i64) -> Result[time.DateTime, postgres.Error] {
+    // years 0 to 9999 (days -719528 .. 2932896 since 1970)
+    if days < -719528 || days > 2932896 { return Err(dfail("date out of range")) }
+    Ok(time.unix(days * 86400).utc())
+}
+
+fn timestamp_of_micros(micros: i64, offset: i64) -> Result[time.DateTime, postgres.Error] {
+    let secs = floor_div(micros, 1000000) + PG_EPOCH_SECS
+    if secs < -62167219200 || secs > 253402300799 { return Err(dfail("timestamp out of range")) }
+    let us = floor_mod(micros, 1000000)
+    Ok(time.timestamp(secs, us * 1000).to_datetime(offset))
+}
+
+/// "2026-11-05" -> the date at midnight.
+fn parse_date_text(s: String) -> Option[time.DateTime] {
+    let b = s.bytes()
+    if b.len() != 10 || b[4] != 45 || b[7] != 45 { return None }
+    let y = strings.parse_i64(s.slice(0, 4)).ok()?
+    let m = strings.parse_i64(s.slice(5, 7)).ok()?
+    let d = strings.parse_i64(s.slice(8, 10)).ok()?
+    time.datetime(y, m, d, 0, 0, 0, 0, 0).ok()
+}
+
+/// "2026-11-05 13:45:01.123456+02" and its variants (no zone, `+HH`, `+HH:MM`, `+HH:MM:SS`).
+fn parse_timestamp_text(s: String) -> Option[time.DateTime] {
+    let b = s.bytes()
+    if b.len() < 19 || b[4] != 45 || b[7] != 45 || (b[10] != 32 && b[10] != 84) || b[13] != 58 || b[16] != 58 { return None }
+    let y = strings.parse_i64(s.slice(0, 4)).ok()?
+    let mo = strings.parse_i64(s.slice(5, 7)).ok()?
+    let d = strings.parse_i64(s.slice(8, 10)).ok()?
+    let h = strings.parse_i64(s.slice(11, 13)).ok()?
+    let mi = strings.parse_i64(s.slice(14, 16)).ok()?
+    let sec = strings.parse_i64(s.slice(17, 19)).ok()?
+    let mut i: usize = 19
+    let mut nanos: i64 = 0
+    if i < b.len() && b[i] == 46 {
+        i += 1
+        let mut digits: usize = 0
+        let mut scale: i64 = 100000000
+        while i < b.len() && b[i] >= 48 && b[i] <= 57 {
+            if digits < 9 {
+                nanos += ((b[i] - 48) as i64) * scale
+                scale = scale / 10
+            }
+            digits += 1
+            i += 1
+        }
+        if digits == 0 { return None }
+    }
+    let mut off: i64 = 0
+    if i < b.len() {
+        let sign: i64 = if b[i] == 43 { 1 } else if b[i] == 45 { -1 } else { return None }
+        let zone = s.slice(i + 1, b.len())
+        let parts = strings.split(zone, ":")
+        if parts.len() < 1 || parts.len() > 3 { return None }
+        let zh = strings.parse_i64(parts[0]).ok()?
+        let zm = if parts.len() > 1 { strings.parse_i64(parts[1]).ok()? } else { 0 }
+        let zs = if parts.len() > 2 { strings.parse_i64(parts[2]).ok()? } else { 0 }
+        if zh > 15 || zm > 59 || zs > 59 { return None }
+        off = sign * (zh * 60 + zm)
+        if zs >= 30 { off = off + sign }
+    }
+    time.datetime(y, mo, d, h, mi, sec, nanos, off).ok()
+}
+
+// ------------------------------------------------------------------------------------- decode
+
+fn bytea_text(s: List[u8]) -> Result[List[u8], postgres.Error] {
+    // hex form "\x..." (bytea_output = hex, the default); the escape form is not produced by
+    // servers since 9.0 unless the setting is changed
+    if s.len() >= 2 && s[0] == 92 && s[1] == 120 {
+        match encoding.unhex(s.slice(2, s.len())) {
+            Ok(b) => { return Ok(b) }
+            Err(_) => { return Err(dfail("bytea: bad hex")) }
+        }
+    }
+    Err(dfail("bytea: output is not in hex form (set bytea_output = 'hex')"))
+}
+
+/// A cell of type `oid`, in the binary or the text form, as a `Value`. `Null` is not a cell: a
+/// NULL has no data (`decode_cell`).
+pub fn decode(oid: u32, binary: bool, data: List[u8]) -> Result[postgres.Value, postgres.Error] {
+    if oid == postgres.OID_BOOL {
+        if binary {
+            if data.len() != 1 || data[0] > 1 { return Err(dfail("bool: bad binary value")) }
+            return Ok(postgres.Bool(data[0] == 1))
+        }
+        if data.len() == 1 && data[0] == 116 { return Ok(postgres.Bool(true)) }
+        if data.len() == 1 && data[0] == 102 { return Ok(postgres.Bool(false)) }
+        return Err(dfail("bool: bad text value"))
+    }
+    if oid == postgres.OID_INT2 || oid == postgres.OID_INT4 || oid == postgres.OID_INT8 {
+        if binary {
+            let want: usize = if oid == postgres.OID_INT2 { 2 } else if oid == postgres.OID_INT4 { 4 } else { 8 }
+            if data.len() != want { return Err(dfail("integer: bad binary size")) }
+            let mut v = be_i64(data)
+            // sign-extend the narrow forms
+            if want == 2 && v >= 32768 { v = v - 65536 }
+            if want == 4 && v >= 2147483648 { v = v - 4294967296 }
+            return Ok(postgres.Int(v))
+        }
+        let t = text(data)?
+        match strings.parse_i64(t) {
+            Ok(v) => { return Ok(postgres.Int(v)) }
+            Err(_) => { return Err(dfail("integer: bad text value")) }
+        }
+    }
+    if oid == postgres.OID_OID {
+        if binary {
+            if data.len() != 4 { return Err(dfail("oid: bad binary size")) }
+            return Ok(postgres.Int(be_u32(data) as i64))
+        }
+        let t = text(data)?
+        match strings.parse_i64(t) {
+            Ok(v) => { return Ok(postgres.Int(v)) }
+            Err(_) => { return Err(dfail("oid: bad text value")) }
+        }
+    }
+    if oid == postgres.OID_FLOAT4 {
+        if binary {
+            if data.len() != 4 { return Err(dfail("float4: bad binary size")) }
+            let f = f32.from_bits(be_u32(data))
+            return Ok(postgres.Float(f as f64))
+        }
+        let t = text(data)?
+        match strings.parse_f64(t) {
+            Ok(v) => { return Ok(postgres.Float(v)) }
+            Err(_) => { return Err(dfail("float4: bad text value")) }
+        }
+    }
+    if oid == postgres.OID_FLOAT8 {
+        if binary {
+            if data.len() != 8 { return Err(dfail("float8: bad binary size")) }
+            return Ok(postgres.Float(f64.from_bits(be_u64(data))))
+        }
+        let t = text(data)?
+        match strings.parse_f64(t) {
+            Ok(v) => { return Ok(postgres.Float(v)) }
+            Err(_) => { return Err(dfail("float8: bad text value")) }
+        }
+    }
+    let texty = oid == postgres.OID_TEXT || oid == postgres.OID_VARCHAR || oid == postgres.OID_BPCHAR || oid == postgres.OID_NAME || oid == postgres.OID_CHAR || oid == postgres.OID_UNKNOWN
+    if texty {
+        return Ok(postgres.Text(text(data)?))
+    }
+    if oid == postgres.OID_BYTEA {
+        if binary { return Ok(postgres.Bytes(data)) }
+        return Ok(postgres.Bytes(bytea_text(data)?))
+    }
+    if oid == postgres.OID_UUID {
+        if binary {
+            if data.len() != 16 { return Err(dfail("uuid: bad binary size")) }
+            return Ok(postgres.Uuid(uuid_text(data)))
+        }
+        return Ok(postgres.Uuid(text(data)?))
+    }
+    if oid == postgres.OID_NUMERIC {
+        if binary { return Ok(postgres.Numeric(numeric_binary(data)?)) }
+        return Ok(postgres.Numeric(text(data)?))
+    }
+    if oid == postgres.OID_JSON { return Ok(postgres.Json(text(data)?)) }
+    if oid == postgres.OID_JSONB {
+        if binary {
+            if data.len() < 1 || data[0] != 1 { return Err(dfail("jsonb: bad version")) }
+            return Ok(postgres.Json(text(data.slice(1, data.len()))?))
+        }
+        return Ok(postgres.Json(text(data)?))
+    }
+    if oid == postgres.OID_DATE {
+        if binary {
+            if data.len() != 4 { return Err(dfail("date: bad binary size")) }
+            let mut d = be_i64(data)
+            if d >= 2147483648 { d = d - 4294967296 }
+            if d == 2147483647 || d == -2147483648 { return Ok(postgres.Raw(oid, false, "infinity".bytes())) }
+            return Ok(postgres.Date(date_of_days(d + PG_EPOCH_DAYS)?))
+        }
+        let t = text(data)?
+        match parse_date_text(t) {
+            Some(d) => { return Ok(postgres.Date(d)) }
+            None => { return Ok(postgres.Raw(oid, false, data)) }
+        }
+    }
+    if oid == postgres.OID_TIMESTAMP || oid == postgres.OID_TIMESTAMPTZ {
+        let tz = oid == postgres.OID_TIMESTAMPTZ
+        if binary {
+            if data.len() != 8 { return Err(dfail("timestamp: bad binary size")) }
+            let us = be_i64(data)
+            if us == 9223372036854775807 || us == -9223372036854775807 - 1 { return Ok(postgres.Raw(oid, false, "infinity".bytes())) }
+            let dt = timestamp_of_micros(us, 0)?
+            return Ok(if tz { postgres.TimestampTz(dt) } else { postgres.Timestamp(dt) })
+        }
+        let t = text(data)?
+        match parse_timestamp_text(t) {
+            Some(dt) => { return Ok(if tz { postgres.TimestampTz(dt) } else { postgres.Timestamp(dt) }) }
+            None => { return Ok(postgres.Raw(oid, false, data)) }
+        }
+    }
+    let el = array_element(oid)
+    if el != 0 && !binary {
+        let t = text(data)?
+        return decode_array_text(el, t)
+    }
+    Ok(postgres.Raw(oid, binary, data))
+}
+
+/// A cell that may be NULL.
+pub fn decode_cell(oid: u32, binary: bool, cell: Option[List[u8]]) -> Result[postgres.Value, postgres.Error] {
+    match cell {
+        Some(d) => decode(oid, binary, d)
+        None => Ok(postgres.Null)
+    }
+}
+
+// ------------------------------------------------------------------------- arrays (text form)
+
+/// Reads `{a,b,"c d",NULL,{...}}` (and the `[lo:hi]=` prefix) with elements of type `el`.
+fn decode_array_text(el: u32, s: String) -> Result[postgres.Value, postgres.Error] {
+    let b = s.bytes()
+    let mut i: usize = 0
+    if b.len() > 0 && b[0] == 91 {
+        // dimension decoration [1:3]= ... skip to '='
+        match bytes.find_byte(b, 61, 0) {
+            Some(k) => { i = k + 1 }
+            None => { return Err(dfail("array: bad dimension prefix")) }
+        }
+    }
+    let (v, next) = array_level(el, b, i, 0)?
+    if next != b.len() { return Err(dfail("array: trailing text")) }
+    Ok(v)
+}
+
+fn array_level(el: u32, b: List[u8], at: usize, depth: u32) -> Result[(postgres.Value, usize), postgres.Error] {
+    if depth > 32 { return Err(dfail("array: nested too deeply")) }
+    if at >= b.len() || b[at] != 123 { return Err(dfail(r"array: expected {")) }
+    let mut i = at + 1
+    let mut items: List[postgres.Value] = List.new()
+    if i < b.len() && b[i] == 125 { return Ok((postgres.Array(items), i + 1)) }
+    while true {
+        if i >= b.len() { return Err(dfail("array: unterminated")) }
+        if b[i] == 123 {
+            let (sub, next) = array_level(el, b, i, depth + 1)?
+            items.push(sub)
+            i = next
+        } else if b[i] == 34 {
+            // quoted element with backslash escapes
+            i += 1
+            let mut e: List[u8] = List.new()
+            let mut closed = false
+            while i < b.len() {
+                if b[i] == 92 {
+                    if i + 1 >= b.len() { return Err(dfail("array: bad escape")) }
+                    e.push(b[i + 1])
+                    i += 2
+                } else if b[i] == 34 {
+                    closed = true
+                    i += 1
+                    break
+                } else {
+                    e.push(b[i])
+                    i += 1
+                }
+            }
+            if !closed { return Err(dfail("array: unterminated string")) }
+            items.push(decode(el, false, e)?)
+        } else {
+            let start = i.copy()
+            while i < b.len() && b[i] != 44 && b[i] != 125 { i += 1 }
+            let e = b.slice(start, i)
+            if e.len() == 4 && e[0] == 78 && e[1] == 85 && e[2] == 76 && e[3] == 76 {
+                items.push(postgres.Null)
+            } else {
+                if e.len() == 0 { return Err(dfail("array: empty element")) }
+                items.push(decode(el, false, e)?)
+            }
+        }
+        if i >= b.len() { return Err(dfail("array: unterminated")) }
+        if b[i] == 44 {
+            i += 1
+        } else if b[i] == 125 {
+            return Ok((postgres.Array(items), i + 1))
+        } else {
+            return Err(dfail(r"array: expected , or }"))
+        }
+    }
+    Err(dfail("array: unterminated"))
+}
+
+// ------------------------------------------------------------------------------------- encode
+
+fn put_i64(inout o: List[u8], v: i64) { encoding.push_i64_be(inout o, v) }
+
+/// The text of a date for a parameter: `2026-11-05`.
+pub fn date_text(d: time.DateTime) -> String {
+    let mut s = pad(d.year, 4)
+    s.push_str("-")
+    s.append(pad(d.month, 2))
+    s.push_str("-")
+    s.append(pad(d.day, 2))
+    s
+}
+
+/// The text of a timestamp for a parameter: `2026-11-05 13:45:01.123456`, with the offset (`+02:00`)
+/// when `zoned`.
+pub fn timestamp_text(d: time.DateTime, zoned: bool) -> String {
+    let mut s = date_text(d)
+    s.push_str(" ")
+    s.append(pad(d.hour, 2))
+    s.push_str(":")
+    s.append(pad(d.minute, 2))
+    s.push_str(":")
+    s.append(pad(d.second, 2))
+    if d.nanos != 0 {
+        s.push_str(".")
+        s.append(pad(d.nanos / 1000, 6))
+    }
+    if zoned {
+        let o = if d.offset_min < 0 { 0 - d.offset_min } else { d.offset_min }
+        s.push_str(if d.offset_min < 0 { "-" } else { "+" })
+        s.append(pad(o / 60, 2))
+        s.push_str(":")
+        s.append(pad(o % 60, 2))
+    }
+    s
+}
+
+fn float_text(f: f64) -> String {
+    if f != f { return String.from("NaN") }
+    if f - f != 0.0 { return if f > 0.0 { String.from("Infinity") } else { String.from("-Infinity") } }
+    f.to_string()
+}
+
+fn array_element_text(v: postgres.Value) -> Result[String, postgres.Error] {
+    match v {
+        postgres.Null => Ok(String.from("NULL"))
+        postgres.Bool(b) => Ok(String.from(if b { "t" } else { "f" }))
+        postgres.Int(n) => Ok(String.from_int(n))
+        postgres.Float(f) => Ok(float_text(f))
+        postgres.Numeric(s) => Ok(s)
+        postgres.Date(d) => Ok(quoted(date_text(d)))
+        postgres.Timestamp(d) => Ok(quoted(timestamp_text(d, false)))
+        postgres.TimestampTz(d) => Ok(quoted(timestamp_text(d, true)))
+        postgres.Text(s) => Ok(quoted(s))
+        postgres.Uuid(s) => Ok(quoted(s))
+        postgres.Json(s) => Ok(quoted(s))
+        postgres.Bytes(b) => {
+            let mut h = String.from("\\x")
+            h.append(encoding.hex(b))
+            Ok(quoted(h))
+        }
+        postgres.Array(items) => array_text(items)
+        postgres.Raw(oid, bin, data) => Err(postgres.fail(postgres.Param, "a Raw value cannot go in an array parameter"))
+    }
+}
+
+fn quoted(s: String) -> String {
+    let mut o: List[u8] = List.new()
+    o.push(34)
+    for c in s.bytes() {
+        if c == 34 || c == 92 { o.push(92) }
+        o.push(c)
+    }
+    o.push(34)
+    utf8.lossy(o)
+}
+
+/// The array literal `{1,2,NULL}` of a list of values (nested arrays for more dimensions).
+pub fn array_text(items: List[postgres.Value]) -> Result[String, postgres.Error] {
+    let mut s = String.from(r"{")
+    let mut first = true
+    for it in items {
+        if !first { s.push_str(",") }
+        first = false
+        s.append(array_element_text(it)?)
+    }
+    s.push_str(r"}")
+    Ok(s)
+}
+
+fn text_param(oid: u32, s: String) -> wire.Param { wire.Param(oid, false, Some(s.bytes())) }
+
+/// The Bind parameter for a value.
+pub fn param(v: postgres.Value) -> Result[wire.Param, postgres.Error] {
+    match v {
+        postgres.Null => Ok(wire.Param(0, false, None))
+        postgres.Bool(b) => Ok(text_param(0, String.from(if b { "t" } else { "f" })))
+        postgres.Int(n) => Ok(text_param(0, String.from_int(n)))
+        postgres.Float(f) => Ok(text_param(0, float_text(f)))
+        postgres.Bytes(b) => Ok(wire.Param(postgres.OID_BYTEA, true, Some(b)))
+        postgres.Text(s) => Ok(text_param(0, s))
+        postgres.Numeric(s) => Ok(text_param(0, s))
+        postgres.Uuid(s) => Ok(text_param(0, s))
+        postgres.Json(s) => Ok(text_param(0, s))
+        postgres.Date(d) => Ok(text_param(0, date_text(d)))
+        postgres.Timestamp(d) => Ok(text_param(0, timestamp_text(d, false)))
+        postgres.TimestampTz(d) => Ok(text_param(0, timestamp_text(d, true)))
+        postgres.Array(items) => Ok(text_param(0, array_text(items)?))
+        postgres.Raw(oid, bin, data) => Ok(wire.Param(oid, bin, Some(data)))
+    }
+}
+
+/// A numeric's text read as a float (`NaN`, `Infinity` and digits with a fraction or exponent).
+pub fn parse_float(s: String) -> Option[f64] {
+    match strings.parse_f64(s) {
+        Ok(f) => Some(f)
+        Err(_) => None
+    }
+}
+
+/// The column named `name` of a result.
+pub fn column_index(rs: postgres.Rows, name: str) -> Option[usize] { rs.column_index(name) }
+
+/// Cell `c` of row `r` of a result as a `Value`.
+pub fn value(rs: postgres.Rows, r: usize, c: usize) -> Result[postgres.Value, postgres.Error] {
+    if r >= rs.rows.len() || c >= rs.columns.len() { return Err(dfail("no such cell")) }
+    let col = rs.columns[c]
+    let cell = if c < rs.rows[r].cells.len() { rs.rows[r].cells[c] } else { None }
+    match decode_cell(col.type_oid, col.format == 1, cell) {
+        Ok(v) => Ok(v)
+        Err(e) => {
+            var pe = e.copy()
+            var m = String.from("column ")
+            m.append(col.name.copy())
+            m.push_str(": ")
+            m.append(e.message.copy())
+            pe.message = m
+            Err(pe)
+        }
+    }
+}
+
+/// The cell of row `r` in the column called `name`.
+pub fn get(rs: postgres.Rows, r: usize, name: str) -> Result[postgres.Value, postgres.Error] {
+    match rs.column_index(name) {
+        Some(c) => value(rs, r, c)
+        None => {
+            var m = String.from("no column named ")
+            m.append(String.from(name))
+            Err(dfail_text(m))
+        }
+    }
+}

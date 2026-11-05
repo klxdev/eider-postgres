@@ -1,0 +1,305 @@
+//! postgres.pool: a bounded pool of connections for tasks.
+//!
+//! A `Pool` holds at most `max` connections. Its copies share it, so every task gets one (like a
+//! `Channel`). `with(pool, dl, f)` takes a connection, runs `f` on it and gives it back; `acquire`
+//! and `release` do the same in two steps for code that cannot be a closure.
+//!
+//! - Bounded and fair: the pool has `max` tokens in a FIFO channel; a connection in use holds
+//!   one. A task that wants a connection takes a token, and when none is left it waits, in line,
+//!   until its deadline: tasks are served in the order they asked, and the pool never has more
+//!   than `max` connections open (idle ones and the ones in use together).
+//! - Lazy and warm: with a token in hand a task takes the idle connection used last (the others
+//!   stay idle and can time out) or, when there is none, opens a new one. `min` connections are
+//!   opened when the pool is made.
+//! - Idle timeout and lifetime: a connection idle longer than `idle_timeout_ms`, or older than
+//!   `max_lifetime_ms`, is closed when it comes up and replaced; `reap` does it for all idle
+//!   connections now and tops the pool up to `min` (call it from a timer task).
+//! - Health check: a connection that was idle for `check_after_idle_ms` or more is pinged (an empty
+//!   query) before it is handed out; a dead one is replaced.
+//! - A connection that comes back in a transaction is rolled back; one that is unusable (an I/O
+//!   or protocol error, a timeout the server did not answer) is closed and its token returned.
+//!   A function that traps inside `with` costs one connection, not a token: the connection is
+//!   closed, the server rolls its transaction back, and the pool opens another when needed.
+//!
+//! `max` bounds the connections, not the tasks; a task waiting for a token parks, it does not hold
+//! a thread.
+
+import std.chan
+import std.strings
+import std.sync
+import std.task
+import std.time
+import postgres
+import postgres.client
+
+/// What a pool is made of.
+pub type PoolConfig = {
+    /// Connections opened when the pool is made, and kept by `reap`.
+    min: usize,
+    /// The most connections open at once (at least 1).
+    max: usize,
+    /// An idle connection older than this is closed when it comes up (0: no limit).
+    idle_timeout_ms: i64,
+    /// A connection older than this is closed when it comes back (0: no limit).
+    max_lifetime_ms: i64,
+    /// A connection idle at least this long is pinged before use (0: every time; -1: never).
+    check_after_idle_ms: i64,
+    /// How long a ping may take.
+    check_timeout_ms: i64
+}
+
+/// The defaults: no minimum, 10 connections at most, 5 minutes idle, 30 minutes of life, a ping
+/// after one second idle.
+pub fn pool_config() -> PoolConfig { PoolConfig(0, 10, 300000, 1800000, 1000, 2000) }
+
+type IdleConn = { conn: client.Conn, since: i64, born: i64 }
+
+type State = { idle: List[IdleConn], open: usize, closed: bool, opened: u64, discarded: u64 }
+
+/// A pool; copies share it.
+pub type Pool = { cfg: postgres.Config, pc: PoolConfig, tokens: chan.Channel[bool], st: sync.Lock[State] }
+
+/// A connection taken from the pool, to give back with `release` (or `discard`).
+pub type Lease = { conn: client.Conn, born: i64 }
+
+/// What a pool looks like now.
+pub type Stats = { max: usize, open: usize, idle: usize, in_use: usize, opened: u64, discarded: u64, closed: bool }
+
+fn now_ms() -> i64 uses clock { time.mono_ms() }
+
+fn closed_error() -> postgres.Error { postgres.fail(postgres.Usage, "the pool is closed") }
+
+/// Gives a token back.
+fn give_back(p: Pool) uses io {
+    match p.tokens.try_send(true) {
+        chan.Sent => {}
+        _ => {}
+    }
+}
+
+/// Makes a pool for connections with `cfg`, opening `pc.min` of them now (before `dl`).
+pub fn new(cfg: postgres.Config, pc: PoolConfig, dl: time.Deadline) -> Result[Pool, postgres.Error] uses net, io, clock, fs {
+    if pc.max < 1 { return Err(postgres.fail(postgres.BadConfig, "a pool needs at least one connection")) }
+    if pc.min > pc.max { return Err(postgres.fail(postgres.BadConfig, "the pool's minimum is above its maximum")) }
+    let tokens: chan.Channel[bool] = chan.bounded(pc.max)
+    let p = Pool(cfg.copy(), pc, tokens, sync.lock(State(List.new(), 0, false, 0, 0)))
+    let mut i: usize = 0
+    while i < pc.max {
+        give_back(p)
+        i += 1
+    }
+    i = 0
+    while i < pc.min {
+        match client.connect(cfg, dl) {
+            Ok(c) => {
+                let t = now_ms()
+                p.st.modify(|inout s: State| -> () {
+                    s.open += 1
+                    s.opened += 1
+                    s.idle.push(IdleConn(c, t, t))
+                })
+            }
+            Err(e) => {
+                close(p)
+                return Err(e)
+            }
+        }
+        i += 1
+    }
+    Ok(p)
+}
+
+fn drop_conn(p: Pool, c: client.Conn) uses io, clock {
+    let mut cc = c.copy()
+    cc.close()
+    p.st.modify(|inout s: State| -> () {
+        if s.open > 0 { s.open -= 1 }
+        s.discarded += 1
+    })
+}
+
+fn pop_idle(p: Pool) -> Option[IdleConn] uses io {
+    p.st.modify(|inout s: State| -> Option[IdleConn] { s.idle.pop() })
+}
+
+/// Takes a connection: the idle one used last (pinged if it was idle a while), else a new one,
+/// waiting in line for a token until `dl` when `max` connections are in use. The error of a failed
+/// connect is returned and the token is kept for the next caller.
+pub fn acquire(p: Pool, dl: time.Deadline) -> Result[Lease, postgres.Error] uses net, io, clock, fs {
+    match p.tokens.recv(dl) {
+        chan.Empty => {
+            return Err(postgres.fail(postgres.Timeout, "the pool is exhausted: no connection came free before the deadline"))
+        }
+        chan.Closed => { return Err(closed_error()) }
+        chan.Value(tok) => {}
+    }
+    if p.st.modify(|inout s: State| -> bool { s.closed }) { return Err(closed_error()) }
+    while true {
+        match pop_idle(p) {
+            Some(ic) => {
+                let t = now_ms()
+                let idle_for = t - ic.since
+                let too_old = (p.pc.idle_timeout_ms > 0 && idle_for > p.pc.idle_timeout_ms) || (p.pc.max_lifetime_ms > 0 && t - ic.born > p.pc.max_lifetime_ms)
+                if too_old || !ic.conn.usable() {
+                    drop_conn(p, ic.conn)
+                    continue
+                }
+                let mut conn = ic.conn.copy()
+                if p.pc.check_after_idle_ms >= 0 && idle_for >= p.pc.check_after_idle_ms {
+                    let by = time.after_ms(p.pc.check_timeout_ms).earlier(dl)
+                    match conn.ping(by) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            drop_conn(p, conn)
+                            continue
+                        }
+                    }
+                }
+                return Ok(Lease(conn, ic.born))
+            }
+            None => { break }
+        }
+    }
+    match client.connect(p.cfg, dl) {
+        Ok(c) => {
+            p.st.modify(|inout s: State| -> () {
+                s.open += 1
+                s.opened += 1
+            })
+            Ok(Lease(c, now_ms()))
+        }
+        Err(e) => {
+            give_back(p)
+            Err(e)
+        }
+    }
+}
+
+/// Gives a connection back. One in an open transaction is rolled back first (at most a second);
+/// one that cannot be used, or is past its lifetime, or comes back to a closed pool, is closed.
+pub fn release(p: Pool, l: Lease) uses net, io, clock, fs {
+    let mut c = l.conn.copy()
+    if c.usable() && c.in_transaction() {
+        let z = c.rollback(time.after_ms(1000))
+    }
+    let t = now_ms()
+    let closed = p.st.modify(|inout s: State| -> bool { s.closed })
+    let old = p.pc.max_lifetime_ms > 0 && t - l.born > p.pc.max_lifetime_ms
+    if closed || old || !c.usable() || c.in_transaction() {
+        drop_conn(p, c)
+    } else {
+        let keep = IdleConn(c, t, l.born)
+        let stored = p.st.modify(|inout s: State| -> bool {
+            if s.closed { return false }
+            s.idle.push(keep)
+            true
+        })
+        if !stored { drop_conn(p, l.conn) }
+    }
+    give_back(p)
+}
+
+/// Closes a connection instead of giving it back (it is known to be bad); the token is returned.
+pub fn discard(p: Pool, l: Lease) uses net, io, clock, fs {
+    drop_conn(p, l.conn)
+    give_back(p)
+}
+
+fn trap_error(m: String) -> postgres.Error {
+    var e = postgres.fail(postgres.Closed, "the function trapped; its connection was closed and the server rolls back its transaction")
+    e.detail = m
+    e
+}
+
+/// Runs `f` on a connection from the pool and gives the connection back. When `f` traps, the
+/// trap is caught (the error is `Closed`, with the trap's message in `detail`), the connection is
+/// closed and the token returned, so one bad task cannot shrink the pool.
+pub fn with[T](p: Pool, dl: time.Deadline, f: fn(inout client.Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock, fs {
+    let lease = acquire(p, dl)?
+    let caught = task.catch(|| -> (client.Conn, Result[T, postgres.Error]) {
+        let mut cc = lease.conn.copy()
+        let r = f(inout cc)
+        (cc, r)
+    })
+    match caught {
+        Ok(pair) => {
+            let (cc, r) = pair
+            release(p, Lease(cc, lease.born))
+            r
+        }
+        Err(m) => {
+            discard(p, lease)
+            Err(trap_error(m))
+        }
+    }
+}
+
+/// One statement on a pooled connection (`Conn.query`).
+pub fn query[A: strings.Text](p: Pool, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[postgres.Rows, postgres.Error] uses net, io, clock, fs {
+    let mut l = acquire(p, dl)?
+    let r = l.conn.query(sql, params, dl)
+    release(p, l)
+    r
+}
+
+/// One command on a pooled connection (`Conn.exec`).
+pub fn exec[A: strings.Text](p: Pool, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock, fs {
+    let mut l = acquire(p, dl)?
+    let r = l.conn.exec(sql, params, dl)
+    release(p, l)
+    r
+}
+
+/// Closes idle connections that are past their idle timeout or lifetime, and opens connections
+/// up to `min` (before `dl`). Returns how many were closed.
+pub fn reap(p: Pool, dl: time.Deadline) -> usize uses net, io, clock, fs {
+    let t = now_ms()
+    let pc = p.pc.copy()
+    let dead = p.st.modify(|inout s: State| -> List[IdleConn] {
+        let mut keep: List[IdleConn] = List.new()
+        let mut gone: List[IdleConn] = List.new()
+        for ic in s.idle {
+            let expired = (pc.idle_timeout_ms > 0 && t - ic.since > pc.idle_timeout_ms) || (pc.max_lifetime_ms > 0 && t - ic.born > pc.max_lifetime_ms) || !ic.conn.usable()
+            if expired { gone.push(ic) } else { keep.push(ic) }
+        }
+        s.idle = keep
+        gone
+    })
+    for ic in dead { drop_conn(p, ic.conn) }
+    // top up to the minimum
+    while p.st.modify(|inout s: State| -> usize { s.open }) < p.pc.min {
+        match client.connect(p.cfg, dl) {
+            Ok(c) => {
+                let now = now_ms()
+                p.st.modify(|inout s: State| -> () {
+                    s.open += 1
+                    s.opened += 1
+                    s.idle.push(IdleConn(c, now, now))
+                })
+            }
+            Err(e) => { return dead.len() }
+        }
+    }
+    dead.len()
+}
+
+/// What the pool looks like now.
+pub fn stats(p: Pool) -> Stats uses io {
+    p.st.modify(|inout s: State| -> Stats {
+        let idle = s.idle.len()
+        Stats(p.pc.max, s.open, idle, if s.open >= idle { s.open - idle } else { 0 }, s.opened, s.discarded, s.closed)
+    })
+}
+
+/// Closes the pool: idle connections are closed now, tasks waiting for a connection get an
+/// error, and connections in use are closed when they are released.
+pub fn close(p: Pool) uses io, clock {
+    let idle = p.st.modify(|inout s: State| -> List[IdleConn] {
+        s.closed = true
+        let all = s.idle.copy()
+        s.idle.clear()
+        all
+    })
+    p.tokens.close()
+    for ic in idle { drop_conn(p, ic.conn) }
+}

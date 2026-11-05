@@ -1,0 +1,63 @@
+closes at once: connect: Closed: the server closed the connection
+http instead of postgres: connect: Protocol: message from the server is longer than the limit
+length below 4: connect: Closed: the server closed the connection
+length 3: connect: Protocol: message length below 4
+length 0xFFFFFFFF: connect: Protocol: message from the server is longer than the limit
+truncated message: connect: Closed: the server closed the connection
+silent server: connect: Timeout: read: timed out
+unknown message type: connect: Protocol: unknown message type 81 from the server
+bad ReadyForQuery status: connect: Protocol: malformed ReadyForQuery message from the server
+ReadyForQuery with a body of 3: connect: Protocol: malformed ReadyForQuery message from the server
+backend key too short: connect: Protocol: malformed BackendKeyData message from the server
+md5 with a short salt: connect: Protocol: malformed Authentication message from the server
+Kerberos: connect: Unsupported: Kerberos authentication is not supported
+unknown authentication code: connect: Unsupported: an authentication method this client does not know
+SASL without terminator: connect: Protocol: malformed Authentication message from the server
+SASL with another mechanism: connect: Protocol: malformed Authentication message from the server
+SASL continue before start: connect: Protocol: SASLContinue without a SASL start
+SASL final before start: connect: Protocol: SASLFinal without a SASL start
+AuthOk then an error response: connect: Auth: no pg_hba.conf entry
+AuthOk twice: Io: read: Connection reset by peer
+  usable afterwards: false
+SCRAM: AuthOk without the exchange: connect: Auth: the server accepted the login without finishing the SCRAM exchange
+SCRAM: bad server-first: connect: Auth: SCRAM: the server's nonce does not extend the client's
+startup only, then silence: Timeout: read: timed out
+  usable afterwards: false
+unexpected BindComplete first: Protocol: an unexpected message while preparing a statement
+  usable afterwards: false
+parse answered with an error: Closed: the server closed the connection
+  usable afterwards: false
+error, then ReadyForQuery: Server: syntax error
+  usable afterwards: true
+RowDescription claims 1000 fields: Protocol: RowDescription message from the server: length out of range
+  usable afterwards: false
+RowDescription cut short: Closed: the server closed the connection
+  usable afterwards: false
+RowDescription with format code 7: Protocol: malformed RowDescription message from the server
+  usable afterwards: false
+DataRow claims 32767 cells: Protocol: DataRow message from the server: length out of range
+  usable afterwards: false
+DataRow with cell length -5: Protocol: DataRow message from the server: length out of range
+  usable afterwards: false
+DataRow cell longer than the message: Protocol: DataRow message from the server: length out of range
+  usable afterwards: false
+DataRow cut inside the count: Protocol: malformed DataRow message from the server
+  usable afterwards: false
+CommandComplete without NUL: Protocol: malformed CommandComplete message from the server
+  usable afterwards: false
+ErrorResponse without terminator: Protocol: malformed ErrorResponse message from the server
+  usable afterwards: false
+DataRow with more cells than columns: Protocol: a DataRow with another number of cells than the result has columns
+  usable afterwards: false
+a good session: ok, 1 rows
+  usable afterwards: true
+a good session, one byte per write: ok, 1 rows
+  usable afterwards: true
+a good session, 7 bytes per write: ok, 1 rows
+  usable afterwards: true
+result larger than max_result_bytes: Usage: the result is larger than Config.max_result_bytes
+  usable afterwards: true
+message larger than max_message: Protocol: message from the server is longer than the limit
+  usable afterwards: false
+500 notices before the result: ok, 1 rows
+  usable afterwards: true

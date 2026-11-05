@@ -1,0 +1,13 @@
+deadline: Timeout
+returned promptly: true
+usable after the timeout: true
+next query: Int(1)
+in tx: Timeout
+usable true, in tx true, failed true
+rolled back: in tx false
+cancelled: Server 57014 canceling statement due to user request
+cancel sent: 1
+usable true
+next query: Int(2)
+past deadline: Timeout
+usable true

@@ -1,0 +1,137 @@
+// Transactions: begin, commit, rollback, savepoints, the `transaction` helper (Ok commits, Err
+// rolls back, nesting uses savepoints, a trap rolls back and closes), the failed-transaction state.
+
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.tests.util
+
+fn count(inout c: client.Conn) -> i64 uses net, io, clock {
+    let rs = c.query("SELECT count(*) FROM tx_test", List.new(), util.dl()).unwrap()
+    match codec.value(rs, 0, 0).unwrap() {
+        postgres.Int(n) => n
+        _ => -1
+    }
+}
+
+fn insert(inout c: client.Conn, id: i64) -> Result[u64, postgres.Error] uses net, io, clock {
+    c.exec("INSERT INTO tx_test VALUES ($1)", List[postgres.Int(id)], util.dl())
+}
+
+fn main() uses net, io, clock, fs, threads {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let z = c.execute("DROP TABLE IF EXISTS tx_test", dl).unwrap()
+    let z2 = c.execute("CREATE TABLE tx_test (id int PRIMARY KEY)", dl).unwrap()
+
+    // explicit begin / commit / rollback
+    c.begin(dl).unwrap()
+    print("in tx: {c.in_transaction()}")
+    let a = insert(inout c, 1).unwrap()
+    c.rollback(dl).unwrap()
+    print("after rollback: {count(inout c)}, in tx {c.in_transaction()}")
+    c.begin(dl).unwrap()
+    let b = insert(inout c, 1).unwrap()
+    c.commit(dl).unwrap()
+    print("after commit: {count(inout c)}")
+
+    // a failed statement makes the transaction failed until rollback
+    c.begin(dl).unwrap()
+    match insert(inout c, 1) {
+        Ok(n) => print("no error?")
+        Err(e) => print("dup: {e.sqlstate}")
+    }
+    print("failed transaction: {c.transaction_failed()}")
+    match insert(inout c, 2) {
+        Ok(n) => print("no error?")
+        Err(e) => print("in a failed transaction: {e.sqlstate} {e.message}")
+    }
+    c.rollback(dl).unwrap()
+    print("recovered: in tx {c.in_transaction()}, count {count(inout c)}")
+
+    // savepoints
+    c.begin(dl).unwrap()
+    let s1 = insert(inout c, 10).unwrap()
+    c.savepoint(String.from("sp1"), dl).unwrap()
+    let s2 = insert(inout c, 11).unwrap()
+    c.rollback_to(String.from("sp1"), dl).unwrap()
+    print("rolled back to the savepoint: {count(inout c)}")
+    let s3 = insert(inout c, 12).unwrap()
+    c.release(String.from("sp1"), dl).unwrap()
+    c.commit(dl).unwrap()
+    print("after the savepoints: {count(inout c)}")
+    match c.savepoint(String.from("bad name; DROP"), dl) {
+        Ok(u) => print("accepted a bad name")
+        Err(e) => print("savepoint name: {e.kind}")
+    }
+
+    // transaction(): Ok commits
+    let r1 = client.transaction(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let n = insert(inout t, 20)?
+        let m = insert(inout t, 21)?
+        Ok(7)
+    })
+    print("transaction ok: {r1.unwrap()}, count {count(inout c)}")
+    // Err rolls back and comes back
+    let r2 = client.transaction(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let n = insert(inout t, 30)?
+        let m = insert(inout t, 20)?
+        Ok(8)
+    })
+    match r2 {
+        Ok(v) => print("no error?")
+        Err(e) => print("transaction err: {e.sqlstate}")
+    }
+    print("rolled back: count {count(inout c)}, in tx {c.in_transaction()}, usable {c.usable()}")
+    // an application error
+    let r3 = client.transaction(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let n = insert(inout t, 40)?
+        Err(postgres.fail(postgres.Usage, "changed my mind"))
+    })
+    match r3 {
+        Ok(v) => print("no error?")
+        Err(e) => print("application error: {e.message}, count {count(inout c)}")
+    }
+    // nested: the inner failure undoes the inner work only
+    let r4 = client.transaction(inout c, dl, |inout t| -> Result[i64, postgres.Error] {
+        let n = insert(inout t, 50)?
+        let inner = client.transaction(inout t, dl, |inout u| -> Result[i64, postgres.Error] {
+            let m = insert(inout u, 51)?
+            Err(postgres.fail(postgres.Usage, "inner failed"))
+        })
+        match inner {
+            Ok(v) => print("no error?")
+            Err(e) => print("inner: {e.message}")
+        }
+        let inner2 = client.transaction(inout t, dl, |inout u| -> Result[i64, postgres.Error] {
+            let m = insert(inout u, 52)?
+            Ok(1)
+        })
+        Ok(inner2.unwrap())
+    })
+    print("nested: {r4.unwrap()}, count {count(inout c)}")
+    let rows = c.query("SELECT id FROM tx_test ORDER BY id", List.new(), dl).unwrap()
+    let mut ids = String.from("")
+    let mut i: usize = 0
+    while i < rows.rows.len() {
+        ids.append("{codec.value(rows, i, 0).unwrap()} ")
+        i += 1
+    }
+    print(ids)
+
+    // a trap inside the function: the connection is closed and the server rolls back
+    let mut t = util.admin()
+    let r5 = client.transaction(inout t, dl, |inout u| -> Result[i64, postgres.Error] {
+        let m = insert(inout u, 60)?
+        let xs: List[i64] = List.new()
+        Ok(xs[3])
+    })
+    match r5 {
+        Ok(v) => print("no error?")
+        Err(e) => print("trap: {e.kind}, usable {t.usable()}")
+    }
+    print("rolled back by the trap: count {count(inout c)}")
+
+    let z3 = c.execute("DROP TABLE tx_test", dl).unwrap()
+    c.close()
+}

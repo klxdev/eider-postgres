@@ -1,0 +1,59 @@
+// Deadlines and cancellation: a query that outlives its deadline is cancelled on the server and
+// the connection stays usable; another task cancels a running query with its CancelKey; a
+// transaction that was cancelled is in the failed state.
+
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.tests.util
+
+fn main() uses net, io, clock, fs, threads {
+    let mut c = util.admin()
+    let started = time.mono_ms()
+    match c.query("SELECT pg_sleep(30)", List.new(), time.after_ms(300)) {
+        Ok(rs) => print("no timeout?")
+        Err(e) => print("deadline: {e.kind}")
+    }
+    let took = time.mono_ms() - started
+    print("returned promptly: {took < 5000}")
+    print("usable after the timeout: {c.usable()}")
+    let rs = c.query("SELECT 1 AS one", List.new(), util.dl()).unwrap()
+    print("next query: {codec.value(rs, 0, 0).unwrap()}")
+
+    // inside a transaction the cancelled statement leaves it failed
+    c.begin(util.dl()).unwrap()
+    match c.query("SELECT pg_sleep(30)", List.new(), time.after_ms(300)) {
+        Ok(r) => print("no timeout?")
+        Err(e) => print("in tx: {e.kind}")
+    }
+    print("usable {c.usable()}, in tx {c.in_transaction()}, failed {c.transaction_failed()}")
+    c.rollback(util.dl()).unwrap()
+    print("rolled back: in tx {c.in_transaction()}")
+
+    // an explicit cancel from another task
+    let key = c.cancel_key()
+    let th = spawn(|| -> i32 {
+        time.sleep_ms(300)
+        match client.cancel(key, time.after_ms(5000)) {
+            Ok(u) => 1
+            Err(e) => 0
+        }
+    })
+    match c.query("SELECT pg_sleep(30)", List.new(), time.after_ms(20000)) {
+        Ok(r) => print("no cancel?")
+        Err(e) => print("cancelled: {e.kind} {e.sqlstate} {e.message}")
+    }
+    print("cancel sent: {th.join()}")
+    print("usable {c.usable()}")
+    let rs2 = c.query("SELECT 2 AS two", List.new(), util.dl()).unwrap()
+    print("next query: {codec.value(rs2, 0, 0).unwrap()}")
+
+    // a deadline in the past: nothing to wait for
+    match c.query("SELECT 3", List.new(), time.after_ms(0)) {
+        Ok(r) => print("past deadline: answered anyway")
+        Err(e) => print("past deadline: {e.kind}")
+    }
+    print("usable {c.usable()}")
+    c.close()
+}

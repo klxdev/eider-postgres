@@ -1,0 +1,22 @@
+d41d8cd98f00b204e9800998ecf8427e
+900150983cd24fb0d6963f7d28e17f72
+9e107d9d372bb6826bd81d3542a419d6
+a24f1e3ef66950e1327f210e3997ba2c
+md5bb41a296aab6baccb36ff243a562abff
+c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=
+6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=
+true
+postgres: SCRAM: the server's signature is wrong (it does not know the password)
+postgres: SCRAM: the server refused the proof: invalid-proof
+postgres: SCRAM: no signature in the server-final message
+err: postgres: SCRAM: the server's nonce does not extend the client's
+err: postgres: SCRAM: the server's nonce does not extend the client's
+err: postgres: SCRAM: the salt is not base64
+err: postgres: SCRAM: the iteration count is out of range
+err: postgres: SCRAM: the iteration count is out of range
+err: postgres: SCRAM: the iteration count is not a number
+err: postgres: SCRAM: no iteration count in the server-first message
+err: postgres: SCRAM: the server requires an extension this client does not know
+err: postgres: SCRAM: no nonce in the server-first message
+n,,n=,r=abc
+n=,r=abc

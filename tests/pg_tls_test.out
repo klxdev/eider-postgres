@@ -1,0 +1,18 @@
+disable: connected, encrypted false, server says ssl Bool(false) Null
+prefer: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+require: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+verify-full, right root, IP address: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+verify-full, right root, localhost: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+verify-ca, right root: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+verify-full, wrong root: Tls: tls: unable to find a trusted issuer (sent alert unknown_ca)
+verify-full, system roots: Tls: tls: unable to find a trusted issuer (sent alert unknown_ca)
+verify-full, clock after expiry: Tls: tls: certificate has expired (sent alert certificate_expired)
+verify-full, clock before issue: Tls: tls: certificate is not yet valid (sent alert certificate_expired)
+require ignores the clock: connected, encrypted true, server says ssl Bool(true) Text("TLSv1.3")
+verify-full, a bad root file: Tls: tls: unable to find a trusted issuer (sent alert unknown_ca)
+rows over TLS: 20000, last Text("row 20000")
+copy over TLS: 50000 rows
+deadline over TLS: Timeout
+usable true, encrypted true
+next: Int(5)
+pooled sessions over TLS: 9 of 9 encrypted

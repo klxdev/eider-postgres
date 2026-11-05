@@ -1,0 +1,30 @@
+copied in: 3
+  Int(1) Text("ada")
+  Int(2) Text("bob")
+  Int(3) Text("cy\tx")
+copied out: 20 bytes
+1	ada
+2	bob
+3	cy\tx
+
+id,name
+1,ada
+2,bob
+
+limit: Usage the COPY output is larger than max_bytes
+usable: true
+big out: 3577790 bytes
+big in: 200000
+bad data: Server 22P02
+usable: true
+not a copy: Usage
+not a copy out: Usage
+copy through query: Server 57014
+usable: true
+rows now: Int(200003)
+notification on eider_chan: first payload from a backend: true
+nothing more, as expected
+listener still usable: true
+kept: second
+kept: third
+none after unlisten

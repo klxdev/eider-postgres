@@ -1,0 +1,100 @@
+// TLS against a server with ssl=on (scripts/pg-up.sh --tls): sslmode require, prefer, verify-full
+// with the right and the wrong root, a clock past the certificate's life, a large result, COPY and
+// the pool over TLS, and a TLS session while another task cancels.
+
+import std.fs
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.pool
+import postgres.tests.util
+
+fn root(name: str) -> List[u8] uses fs {
+    let mut p = "target/pg/pki/".bytes()
+    p.extend(name.bytes())
+    fs.read(p).unwrap()
+}
+
+fn try_mode(label: str, mode: postgres.SslMode, host: str, roots: Option[List[u8]], now: Option[i64]) uses net, io, clock, fs {
+    var cfg = util.config("eider", "eider_pw")
+    cfg.sslmode = mode
+    cfg.host = String.from(host)
+    cfg.root_cert = roots
+    cfg.tls_now = now
+    match client.connect(cfg, util.dl()) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            let rs = c.query("SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()", List.new(), util.dl()).unwrap()
+            let ssl = codec.value(rs, 0, 0).unwrap_or(postgres.Null)
+            let ver = codec.value(rs, 0, 1).unwrap_or(postgres.Null)
+            print("{label}: connected, encrypted {c.encrypted()}, server says ssl {ssl} {ver}")
+            c.close()
+        }
+        Err(e) => print("{label}: {e.kind}: {e.message}")
+    }
+}
+
+fn main() uses net, io, clock, fs, threads {
+    let ca = root("root.pem")
+    let other = root("other-root.pem")
+    try_mode("disable", postgres.Disable, "127.0.0.1", None, None)
+    try_mode("prefer", postgres.Prefer, "127.0.0.1", None, None)
+    try_mode("require", postgres.Require, "127.0.0.1", None, None)
+    try_mode("verify-full, right root, IP address", postgres.VerifyFull, "127.0.0.1", Some(ca.copy()), None)
+    try_mode("verify-full, right root, localhost", postgres.VerifyFull, "localhost", Some(ca.copy()), None)
+    try_mode("verify-ca, right root", postgres.VerifyCa, "127.0.0.1", Some(ca.copy()), None)
+    try_mode("verify-full, wrong root", postgres.VerifyFull, "127.0.0.1", Some(other), None)
+    try_mode("verify-full, system roots", postgres.VerifyFull, "127.0.0.1", None, None)
+    try_mode("verify-full, clock after expiry", postgres.VerifyFull, "127.0.0.1", Some(ca.copy()), Some(2300000000 as i64 * 2))
+    try_mode("verify-full, clock before issue", postgres.VerifyFull, "127.0.0.1", Some(ca.copy()), Some(1500000000 as i64))
+    try_mode("require ignores the clock", postgres.Require, "127.0.0.1", None, Some(4000000000 as i64))
+    try_mode("verify-full, a bad root file", postgres.VerifyFull, "127.0.0.1", Some("not pem".bytes()), None)
+
+    // a session over TLS
+    var cfg = util.config("eider", "eider_pw")
+    cfg.sslmode = postgres.VerifyFull
+    cfg.root_cert = Some(ca.copy())
+    let mut c = client.connect(cfg, util.dl()).unwrap()
+    let big = c.query("SELECT g, 'row ' || g, repeat('z', 100) FROM generate_series(1, 20000) g", List.new(), util.dl()).unwrap()
+    print("rows over TLS: {big.rows.len()}, last {codec.value(big, 19999, 1).unwrap()}")
+    let z = c.execute("DROP TABLE IF EXISTS tls_copy", util.dl()).unwrap()
+    let z2 = c.execute("CREATE TABLE tls_copy (id int, name text)", util.dl()).unwrap()
+    let data = c.copy_out("COPY (SELECT g, 'n' || g FROM generate_series(1, 50000) g) TO STDOUT", 100000000, util.dl()).unwrap()
+    let n = c.copy_in("COPY tls_copy FROM STDIN", List[data], util.dl()).unwrap()
+    print("copy over TLS: {n} rows")
+    let z3 = c.execute("DROP TABLE tls_copy", util.dl()).unwrap()
+    // a deadline over TLS cancels (the cancel request goes to a second socket) and recovers
+    match c.query("SELECT pg_sleep(30)", List.new(), time.after_ms(300)) {
+        Ok(r) => print("no timeout?")
+        Err(e) => print("deadline over TLS: {e.kind}")
+    }
+    print("usable {c.usable()}, encrypted {c.encrypted()}")
+    let rs = c.query("SELECT 5", List.new(), util.dl()).unwrap()
+    print("next: {codec.value(rs, 0, 0).unwrap()}")
+    c.close()
+
+    // the pool over TLS, from several tasks
+    var pc = pool.pool_config()
+    pc.max = 3
+    let p = pool.new(cfg, pc, util.dl()).unwrap()
+    let mut tasks: List[Task[i64]] = List.new()
+    for i in 0..9 {
+        tasks.push(spawn(|| -> i64 {
+            let r = pool.query(p, "SELECT pg_sleep(0.02), ssl::int FROM pg_stat_ssl WHERE pid = pg_backend_pid()", List.new(), util.dl())
+            match r {
+                Ok(rs) => {
+                    match codec.value(rs, 0, 1) {
+                        Ok(postgres.Int(k)) => k
+                        _ => -1
+                    }
+                }
+                Err(e) => -2
+            }
+        }))
+    }
+    let mut encrypted: i64 = 0
+    for t in tasks { encrypted += t.join() }
+    print("pooled sessions over TLS: {encrypted} of 9 encrypted")
+    pool.close(p)
+}

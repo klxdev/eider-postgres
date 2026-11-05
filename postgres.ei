@@ -1,0 +1,485 @@
+//! postgres: a PostgreSQL client in Eider, over the frontend/backend protocol version 3.
+//!
+//! This module holds the types every other module shares: the typed `Error`, the connection
+//! `Config` and its URL form, the `Value` a parameter or a cell is, and the `Rows` a query
+//! returns. The pieces are modules of their own:
+//!
+//! - `postgres.client`: `connect`, the `Conn` (simple and extended queries, a statement
+//!   cache, transactions and savepoints, COPY, LISTEN/NOTIFY, cancellation, deadlines).
+//! - `postgres.pool`: a bounded connection pool for tasks.
+//! - `postgres.typed`: `query[T]` and `execute_with[P]`, rows decoded into records and
+//!   parameters taken from records through `std/serial`.
+//! - `postgres.secure`: sslmode=require / verify-full over eider-tls; `postgres.client` uses it.
+//! - `postgres.wire`: the protocol messages, encoded and strictly decoded (a hostile server
+//!   gets an `Err`, never a trap); `postgres.codec`: the text and binary forms of the types;
+//!   `postgres.scram` and `postgres.md5`: the password exchanges.
+//!
+//! ```
+//! let mut cfg = postgres.config("127.0.0.1", "app", "appdb")
+//! cfg.password = Some(String.from("secret"))
+//! let mut c = client.connect(cfg, time.after_ms(5000))?
+//! let rows = c.query("SELECT id, name FROM users WHERE id = $1", List[postgres.Int(7)], time.after_ms(2000))?
+//! ```
+//!
+//! Every call that waits takes a `time.Deadline`, as eider-http's does: one budget for the whole
+//! exchange. A deadline that passes while a query runs sends a CancelRequest on a second
+//! connection and gives the server `Config.cancel_grace_ms` to answer; the call returns a
+//! `Timeout` error and the connection is usable again if the server did answer, else it is
+//! `Broken` (`Conn.usable()`), and the pool drops it.
+
+import std.bytes
+import std.encoding
+import std.strings
+import std.time
+import std.utf8
+
+// ---------------------------------------------------------------------------------- errors
+
+/// Where an error comes from.
+///
+/// - `Io`: the socket failed (refused, reset, closed by the server).
+/// - `Timeout`: a deadline passed.
+/// - `Closed`: the connection was closed, or broken by an earlier error.
+/// - `Protocol`: the server sent something the protocol does not allow.
+/// - `Auth`: the server refused the credentials, asked for an unsupported method, or failed
+///   the SCRAM proof.
+/// - `Server`: the server answered with an ErrorResponse (`sqlstate` and the other fields).
+/// - `Tls`: the TLS handshake failed or the server does not do TLS.
+/// - `BadConfig`: the configuration or URL is wrong.
+/// - `Decode`: a cell cannot be read as the type asked for (typed queries, `Row.get_*`).
+/// - `Param`: a parameter cannot be encoded, or there are too many.
+/// - `Usage`: the call is not allowed now (a query while a COPY runs, a pool that is closed).
+/// - `Unsupported`: a protocol feature this client does not have.
+pub type Kind =
+    | Io
+    | Timeout
+    | Closed
+    | Protocol
+    | Auth
+    | Server
+    | Tls
+    | BadConfig
+    | Decode
+    | Param
+    | Usage
+    | Unsupported
+
+/// A failure. For `Server` errors (and notices) the fields are those of PostgreSQL's
+/// ErrorResponse (protocol docs, "Error and Notice Message Fields"); an empty string or 0
+/// means the field was not sent. `message` is always set.
+pub type Error = {
+    kind: Kind,
+    message: String,
+    severity: String,
+    sqlstate: String,
+    detail: String,
+    hint: String,
+    position: u32,
+    internal_position: u32,
+    internal_query: String,
+    context: String,
+    schema: String,
+    table: String,
+    column: String,
+    datatype: String,
+    constraint: String,
+    file: String,
+    line: String,
+    routine: String
+}
+
+/// An error of this kind with this message and no server fields.
+pub fn error(kind: Kind, message: String) -> Error {
+    Error(kind, message, String.from(""), String.from(""), String.from(""), String.from(""), 0, 0, String.from(""), String.from(""),
+          String.from(""), String.from(""), String.from(""), String.from(""), String.from(""), String.from(""), String.from(""), String.from(""))
+}
+
+pub fn fail(kind: Kind, message: str) -> Error { error(kind, String.from(message)) }
+
+impl Error {
+    /// The first two characters of the SQLSTATE: "23" for a constraint violation.
+    fn class(self) -> String {
+        if self.sqlstate.len() < 2 { return String.from("") }
+        self.sqlstate.slice(0, 2)
+    }
+
+    /// Whether this is a server error with this SQLSTATE (`"23505"`: unique_violation).
+    fn is_state(self, code: str) -> bool {
+        self.kind == Server && self.sqlstate == String.from(code)
+    }
+
+    fn is_timeout(self) -> bool { self.kind == Timeout }
+
+    /// Unique violation (23505), foreign key violation (23503), not null (23502), check (23514).
+    fn is_constraint(self) -> bool { self.kind == Server && self.class() == String.from("23") }
+}
+
+impl Show for Error {
+    fn show(self, inout out: String) {
+        match self.kind {
+            Server => {
+                out.append(if self.severity.len() > 0 { self.severity.copy() } else { String.from("ERROR") })
+                if self.sqlstate.len() > 0 {
+                    out.push_str(" ")
+                    out.append(self.sqlstate.copy())
+                }
+                out.push_str(": ")
+                out.append(self.message.copy())
+                if self.detail.len() > 0 {
+                    out.push_str(" (detail: ")
+                    out.append(self.detail.copy())
+                    out.push_str(")")
+                }
+                if self.hint.len() > 0 {
+                    out.push_str(" (hint: ")
+                    out.append(self.hint.copy())
+                    out.push_str(")")
+                }
+                if self.position > 0 {
+                    out.push_str(" (position ")
+                    out.append(String.from_int(self.position as i64))
+                    out.push_str(")")
+                }
+            }
+            _ => {
+                out.push_str("postgres: ")
+                out.append(self.message.copy())
+            }
+        }
+    }
+}
+
+/// `Show` text of an error as a String.
+pub fn error_text(e: Error) -> String {
+    let mut s = String.from("")
+    e.show(inout s)
+    s
+}
+
+// A few SQLSTATE codes (appendix A of the PostgreSQL manual) for `Error.is_state`.
+pub const UNIQUE_VIOLATION: str = "23505"
+pub const FOREIGN_KEY_VIOLATION: str = "23503"
+pub const NOT_NULL_VIOLATION: str = "23502"
+pub const CHECK_VIOLATION: str = "23514"
+pub const SERIALIZATION_FAILURE: str = "40001"
+pub const DEADLOCK_DETECTED: str = "40P01"
+pub const QUERY_CANCELED: str = "57014"
+pub const UNDEFINED_TABLE: str = "42P01"
+pub const SYNTAX_ERROR: str = "42601"
+pub const INVALID_PASSWORD: str = "28P01"
+
+// ------------------------------------------------------------------------------- configuration
+
+/// How a connection treats TLS (libpq's `sslmode`).
+///
+/// - `Disable`: never.
+/// - `Prefer`: ask for TLS (no certificate verification) and go on in clear text if the server
+///   says no. libpq's default; do not use it where an attacker can sit on the network.
+/// - `Require`: TLS or fail; the certificate is not verified (encryption against eavesdropping
+///   only).
+/// - `VerifyCa`, `VerifyFull`: TLS, and the server's certificate is verified against the
+///   `root_cert` (or the system's store) and the host name. eider-tls validates the chain and the
+///   name together, so `VerifyCa` is as strict as `VerifyFull` here.
+pub type SslMode =
+    | Disable
+    | Prefer
+    | Require
+    | VerifyCa
+    | VerifyFull
+
+pub type Config = {
+    host: String,
+    port: i32,
+    user: String,
+    password: Option[String],
+    database: String,
+    sslmode: SslMode,
+    /// PEM text of the trusted roots for `VerifyCa` and `VerifyFull`; None: the system's store.
+    root_cert: Option[List[u8]],
+    application_name: String,
+    /// More startup parameters (`search_path`, `statement_timeout`, `options`, ...), in order.
+    params: List[(String, String)],
+    connect_timeout_ms: i64,
+    /// Prepared statements kept per connection (0: unnamed statements, nothing cached).
+    cache_size: usize,
+    /// The largest message body accepted from the server; a bigger one is a protocol error.
+    max_message: usize,
+    /// The most bytes of cells one result may hold; a bigger result is dropped and the call fails
+    /// with a `Usage` error (the connection stays usable).
+    max_result_bytes: usize,
+    /// How long a timed-out query is given to answer the cancel request before the connection is
+    /// given up.
+    cancel_grace_ms: i64,
+    /// The time certificates are checked at (Unix seconds); None: the clock. For tests.
+    tls_now: Option[i64]
+}
+
+/// A configuration with the usual defaults: port 5432, `sslmode=Prefer`, a cache of 64
+/// statements, messages up to 256 MiB, results up to 1 GiB.
+pub fn config(host: str, user: str, database: str) -> Config {
+    Config(String.from(host), 5432, String.from(user), None, String.from(database), Prefer, None, String.from("eider-postgres"),
+           List.new(), 10000, 64, 268435456, 1073741824, 2000, None)
+}
+
+fn unhex_digit(c: u8) -> Option[u8] {
+    if c >= 48 && c <= 57 { return Some(c - 48) }
+    if c >= 97 && c <= 102 { return Some(c - 87) }
+    if c >= 65 && c <= 70 { return Some(c - 55) }
+    None
+}
+
+/// Percent-decoding (`%40` is `@`); `+` stays a plus. None when a `%` is not followed by two
+/// hex digits or the result is not text.
+pub fn percent_decode(s: String) -> Option[String] {
+    let b = s.bytes()
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < b.len() {
+        if b[i] == 37 {
+            if i + 2 >= b.len() { return None }
+            let hi = unhex_digit(b[i + 1])?
+            let lo = unhex_digit(b[i + 2])?
+            out.push(hi * 16 + lo)
+            i += 3
+        } else {
+            out.push(b[i])
+            i += 1
+        }
+    }
+    match String.from_bytes(out) {
+        Ok(t) => Some(t)
+        Err(_) => None
+    }
+}
+
+fn bad_url(why: str) -> Error { fail(BadConfig, why) }
+
+fn parse_sslmode(v: String) -> Result[SslMode, Error] {
+    if v == String.from("disable") { return Ok(Disable) }
+    if v == String.from("prefer") || v == String.from("allow") { return Ok(Prefer) }
+    if v == String.from("require") { return Ok(Require) }
+    if v == String.from("verify-ca") { return Ok(VerifyCa) }
+    if v == String.from("verify-full") { return Ok(VerifyFull) }
+    Err(bad_url("sslmode must be disable, prefer, require, verify-ca or verify-full"))
+}
+
+/// Reads `postgres://user:password@host:port/database?sslmode=require&application_name=x`
+/// (also `postgresql://`). The user, password and database are percent-decoded; a host in
+/// brackets is an IPv6 address; any other query parameter becomes a startup parameter
+/// (`options`, `search_path`, ...) except `connect_timeout` (seconds) and `sslmode`.
+pub fn parse_url(url: str) -> Result[Config, Error] {
+    let mut rest = String.from(url)
+    match strings.strip_prefix(rest, "postgresql://") {
+        Some(r) => { rest = r }
+        None => {
+            match strings.strip_prefix(rest, "postgres://") {
+                Some(r) => { rest = r }
+                None => { return Err(bad_url("the URL must start with postgres:// or postgresql://")) }
+            }
+        }
+    }
+    let mut query = String.from("")
+    match strings.split_once(rest, "?") {
+        Some((a, q)) => {
+            rest = a
+            query = q
+        }
+        None => {}
+    }
+    let mut dbname = String.from("")
+    match strings.split_once(rest, "/") {
+        Some((a, d)) => {
+            rest = a
+            dbname = match percent_decode(d) {
+                Some(x) => x
+                None => { return Err(bad_url("bad percent-encoding in the database name")) }
+            }
+        }
+        None => {}
+    }
+    let mut hostport = rest.copy()
+    let mut user = String.from("")
+    let mut pass: Option[String] = None
+    match strings.rfind(rest, "@") {
+        Some(at) => {
+            let cred = rest.slice(0, at)
+            hostport = rest.slice(at + 1, rest.len())
+            match strings.split_once(cred, ":") {
+                Some((u, p)) => {
+                    user = match percent_decode(u) {
+                        Some(x) => x
+                        None => { return Err(bad_url("bad percent-encoding in the user")) }
+                    }
+                    pass = match percent_decode(p) {
+                        Some(x) => Some(x)
+                        None => { return Err(bad_url("bad percent-encoding in the password")) }
+                    }
+                }
+                None => {
+                    user = match percent_decode(cred) {
+                        Some(x) => x
+                        None => { return Err(bad_url("bad percent-encoding in the user")) }
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    let mut host = hostport.copy()
+    let mut port: i32 = 5432
+    if hostport.len() > 0 && hostport.byte(0) == 91 {
+        // [v6]:port
+        match strings.find(hostport, "]") {
+            Some(e) => {
+                host = hostport.slice(1, e)
+                let after = hostport.slice(e + 1, hostport.len())
+                if after.len() > 0 {
+                    match strings.strip_prefix(after, ":") {
+                        Some(p) => {
+                            port = match strings.parse_i32(p) {
+                                Ok(n) => n
+                                Err(_) => { return Err(bad_url("the port is not a number")) }
+                            }
+                        }
+                        None => { return Err(bad_url("text after the bracketed host")) }
+                    }
+                }
+            }
+            None => { return Err(bad_url("unterminated [ in the host")) }
+        }
+    } else {
+        match strings.rfind(hostport, ":") {
+            Some(c) => {
+                host = hostport.slice(0, c)
+                port = match strings.parse_i32(hostport.slice(c + 1, hostport.len())) {
+                    Ok(n) => n
+                    Err(_) => { return Err(bad_url("the port is not a number")) }
+                }
+            }
+            None => {}
+        }
+    }
+    if port < 1 || port > 65535 { return Err(bad_url("the port must be 1 to 65535")) }
+    if host.len() == 0 { host = String.from("127.0.0.1") }
+    var cfg = config("x", "x", "x")
+    cfg.host = host
+    cfg.port = port
+    cfg.user = user
+    cfg.password = pass
+    cfg.database = if dbname.len() > 0 { dbname } else { user.copy() }
+    if query.len() > 0 {
+        for pair in strings.split(query, "&") {
+            if pair.len() == 0 { continue }
+            let kv = match strings.split_once(pair, "=") {
+                Some(p) => p
+                None => (pair.copy(), String.from(""))
+            }
+            let (k0, v0) = kv
+            let k = match percent_decode(k0) {
+                Some(x) => x
+                None => { return Err(bad_url("bad percent-encoding in a parameter name")) }
+            }
+            let v = match percent_decode(v0) {
+                Some(x) => x
+                None => { return Err(bad_url("bad percent-encoding in a parameter value")) }
+            }
+            if k == String.from("sslmode") {
+                cfg.sslmode = parse_sslmode(v)?
+            } else if k == String.from("connect_timeout") {
+                let secs = match strings.parse_i64(v) {
+                    Ok(n) => n
+                    Err(_) => { return Err(bad_url("connect_timeout is not a number")) }
+                }
+                if secs < 0 || secs > 86400 { return Err(bad_url("connect_timeout must be 0 to 86400 seconds")) }
+                cfg.connect_timeout_ms = secs * 1000
+            } else if k == String.from("application_name") {
+                cfg.application_name = v
+            } else {
+                cfg.params.push((k, v))
+            }
+        }
+    }
+    if cfg.user.len() == 0 { return Err(bad_url("the URL has no user")) }
+    Ok(cfg)
+}
+
+// -------------------------------------------------------------------------------------- values
+
+/// A parameter or a cell. `Numeric` is the decimal text PostgreSQL uses (`"12.50"`, `"NaN"`),
+/// so no precision is lost; `Json` is the text of a json or jsonb value; `Uuid` the 36 characters
+/// `8-4-4-4-12`. `Date` is a `time.DateTime` at midnight, `Timestamp` a timestamp without time
+/// zone (the fields as stored, offset 0) and `TimestampTz` an instant (UTC). `Raw` is a cell
+/// of a type this client does not decode, as the bytes the server sent (text or binary form,
+/// `binary` says which).
+pub type Value =
+    | Null
+    | Bool(v: bool)
+    | Int(v: i64)
+    | Float(v: f64)
+    | Text(v: String)
+    | Bytes(v: List[u8])
+    | Numeric(v: String)
+    | Uuid(v: String)
+    | Json(v: String)
+    | Date(v: time.DateTime)
+    | Timestamp(v: time.DateTime)
+    | TimestampTz(v: time.DateTime)
+    | Array(v: List[Value])
+    | Raw(oid: u32, binary: bool, v: List[u8])
+
+/// What a result column is.
+pub type Column = { name: String, table_oid: u32, attnum: i32, type_oid: u32, type_size: i32, type_mod: i32, format: u16 }
+
+/// One row: the cells as the server sent them (None is NULL). Decode with `Rows.value(r, i)`,
+/// `Rows.get_*`, or `postgres.typed`.
+pub type Row = { cells: List[Option[List[u8]]] }
+
+/// The result of a statement: the columns (empty for a command), the rows, the command tag
+/// ("SELECT 3", "INSERT 0 1") and the row count from the tag.
+pub type Rows = { columns: List[Column], rows: List[Row], tag: String, affected: u64 }
+
+/// A NOTIFY received on a LISTENing connection.
+pub type Notification = { pid: i32, channel: String, payload: String }
+
+// Type OIDs (pg_type.dat) this client knows.
+pub const OID_BOOL: u32 = 16
+pub const OID_BYTEA: u32 = 17
+pub const OID_CHAR: u32 = 18
+pub const OID_NAME: u32 = 19
+pub const OID_INT8: u32 = 20
+pub const OID_INT2: u32 = 21
+pub const OID_INT4: u32 = 23
+pub const OID_TEXT: u32 = 25
+pub const OID_OID: u32 = 26
+pub const OID_JSON: u32 = 114
+pub const OID_FLOAT4: u32 = 700
+pub const OID_FLOAT8: u32 = 701
+pub const OID_UNKNOWN: u32 = 705
+pub const OID_BPCHAR: u32 = 1042
+pub const OID_VARCHAR: u32 = 1043
+pub const OID_DATE: u32 = 1082
+pub const OID_TIMESTAMP: u32 = 1114
+pub const OID_TIMESTAMPTZ: u32 = 1184
+pub const OID_NUMERIC: u32 = 1700
+pub const OID_UUID: u32 = 2950
+pub const OID_JSONB: u32 = 3802
+
+impl Rows {
+    /// The index of the column called `name`.
+    fn column_index(self, name: str) -> Option[usize] {
+        let want = String.from(name)
+        let mut i: usize = 0
+        while i < self.columns.len() {
+            if self.columns[i].name == want { return Some(i) }
+            i += 1
+        }
+        None
+    }
+
+    fn len(self) -> usize { self.rows.len() }
+
+    fn is_empty(self) -> bool { self.rows.len() == 0 }
+}
+
+/// Text of a byte list that may not be valid UTF-8 (never fails: invalid bytes become U+FFFD).
+pub fn text_of(b: List[u8]) -> String { utf8.lossy(b) }

@@ -1,0 +1,62 @@
+// MD5 and SCRAM-SHA-256 against published vectors; the SCRAM exchange against hostile
+// server-first and server-final messages.
+
+import std.encoding
+import postgres
+import postgres.md5
+import postgres.scram
+
+fn show_err(r: Result[scram.Final, postgres.Error]) uses io {
+    match r {
+        Ok(f) => print("ok")
+        Err(e) => print("err: {postgres.error_text(e)}")
+    }
+}
+
+fn main() uses io {
+    print(md5.md5_hex("".bytes()))
+    print(md5.md5_hex("abc".bytes()))
+    print(md5.md5_hex("The quick brown fox jumps over the lazy dog".bytes()))
+    let mut long: List[u8] = List.new()
+    for i in 0..1000 { long.push((i % 251) as u8) }
+    print(md5.md5_hex(long))
+    let mut salt: List[u8] = List.new()
+    salt.push(1)
+    salt.push(2)
+    salt.push(3)
+    salt.push(4)
+    print(String.from_bytes(md5.password_message(String.from("postgres"), String.from("secret"), salt)).unwrap())
+
+    // RFC 7677 section 3
+    let c = scram.Client(String.from("rOprNGfwEbeRWgbNEkqO"), String.from("n=user,r=rOprNGfwEbeRWgbNEkqO"))
+    let sf = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096".bytes()
+    let f = scram.respond(c, String.from("pencil"), sf).unwrap()
+    print(String.from_bytes(f.message).unwrap())
+    print(encoding.base64(f.server_signature))
+    print(scram.verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".bytes(), f.server_signature).is_ok())
+    match scram.verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl96G4=".bytes(), f.server_signature) {
+        Ok(u) => print("accepted a wrong signature")
+        Err(e) => print(postgres.error_text(e))
+    }
+    match scram.verify("e=invalid-proof".bytes(), f.server_signature) {
+        Ok(u) => print("accepted")
+        Err(e) => print(postgres.error_text(e))
+    }
+    match scram.verify("".bytes(), f.server_signature) {
+        Ok(u) => print("accepted")
+        Err(e) => print(postgres.error_text(e))
+    }
+    // hostile server-first messages
+    show_err(scram.respond(c, String.from("pencil"), "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqOxyz,s=!!,i=4096".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqOxyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqOxyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4294967295".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqOxyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=-1".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "r=rOprNGfwEbeRWgbNEkqOxyz,s=W22ZaJ0SNY7soEsUEjb6gQ==".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "m=ext,r=rOprNGfwEbeRWgbNEkqOxyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096".bytes()))
+    show_err(scram.respond(c, String.from("pencil"), "".bytes()))
+    let (cl, msg) = scram.first(String.from("abc"))
+    print(String.from_bytes(msg).unwrap())
+    print(cl.bare)
+}

@@ -1,0 +1,96 @@
+// COPY IN and OUT, and LISTEN / NOTIFY between two connections.
+
+import std.io
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.tests.util
+
+fn main() uses net, io, clock, fs {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let z = c.execute("DROP TABLE IF EXISTS copy_test", dl).unwrap()
+    let z2 = c.execute("CREATE TABLE copy_test (id int, name text)", dl).unwrap()
+
+    // COPY IN: text format, data in several chunks that split a line
+    let mut chunks: List[List[u8]] = List.new()
+    chunks.push("1\tada\n2\tbo".bytes())
+    chunks.push("b\n3\t".bytes())
+    chunks.push("cy\\tx\n".bytes())
+    let n = c.copy_in("COPY copy_test FROM STDIN", chunks, dl).unwrap()
+    print("copied in: {n}")
+    let rs = c.query("SELECT id, name FROM copy_test ORDER BY id", List.new(), dl).unwrap()
+    for r in 0..rs.rows.len() { print("  {codec.value(rs, r, 0).unwrap()} {codec.value(rs, r, 1).unwrap()}") }
+
+    // COPY OUT
+    let out = c.copy_out("COPY copy_test TO STDOUT", 1000000, dl).unwrap()
+    print("copied out: {out.len()} bytes")
+    io.outln(out)
+    let csv = c.copy_out("COPY (SELECT id, name FROM copy_test WHERE id < 3 ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)", 1000000, dl).unwrap()
+    io.outln(csv)
+    match c.copy_out("COPY copy_test TO STDOUT", 10, dl) {
+        Ok(d) => print("no limit error?")
+        Err(e) => print("limit: {e.kind} {e.message}")
+    }
+    print("usable: {c.usable()}")
+    // a million rows out and back in
+    let big = c.copy_out("COPY (SELECT g, 'name ' || g FROM generate_series(1, 200000) g) TO STDOUT", 100000000, dl).unwrap()
+    print("big out: {big.len()} bytes")
+    let back = c.copy_in("COPY copy_test FROM STDIN", List[big], dl).unwrap()
+    print("big in: {back}")
+
+    // errors
+    match c.copy_in("COPY copy_test FROM STDIN", List["x\ty\n".bytes()], dl) {
+        Ok(k) => print("no error?")
+        Err(e) => print("bad data: {e.kind} {e.sqlstate}")
+    }
+    print("usable: {c.usable()}")
+    match c.copy_in("SELECT 1", List.new(), dl) {
+        Ok(k) => print("no error?")
+        Err(e) => print("not a copy: {e.kind}")
+    }
+    match c.copy_out("SELECT 1", 100, dl) {
+        Ok(k) => print("no error?")
+        Err(e) => print("not a copy out: {e.kind}")
+    }
+    match c.query("COPY copy_test FROM STDIN", List.new(), dl) {
+        Ok(k) => print("no error?")
+        Err(e) => print("copy through query: {e.kind} {e.sqlstate}")
+    }
+    print("usable: {c.usable()}")
+    let cnt = c.query("SELECT count(*) FROM copy_test", List.new(), dl).unwrap()
+    print("rows now: {codec.value(cnt, 0, 0).unwrap()}")
+    let z3 = c.execute("DROP TABLE copy_test", dl).unwrap()
+
+    // LISTEN / NOTIFY
+    let mut listener = util.admin()
+    listener.listen(String.from("eider_chan"), dl).unwrap()
+    c.notify(String.from("eider_chan"), String.from("first payload"), dl).unwrap()
+    match listener.wait_notification(time.after_ms(5000)) {
+        Ok(Some(note)) => print("notification on {note.channel}: {note.payload} from a backend: {note.pid == c.backend_pid()}")
+        Ok(None) => print("nothing arrived")
+        Err(e) => print("error {postgres.error_text(e)}")
+    }
+    match listener.wait_notification(time.after_ms(200)) {
+        Ok(Some(note)) => print("unexpected notification")
+        Ok(None) => print("nothing more, as expected")
+        Err(e) => print("error {postgres.error_text(e)}")
+    }
+    print("listener still usable: {listener.usable()}")
+    // notifications that arrive while the connection is busy are kept
+    c.notify(String.from("eider_chan"), String.from("second"), dl).unwrap()
+    c.notify(String.from("eider_chan"), String.from("third"), dl).unwrap()
+    time.sleep_ms(200)
+    let rs3 = listener.query("SELECT 1", List.new(), dl).unwrap()
+    for note in listener.take_notifications() { print("kept: {note.payload}") }
+    listener.unlisten(String.from("eider_chan"), dl).unwrap()
+    c.notify(String.from("eider_chan"), String.from("after unlisten"), dl).unwrap()
+    match listener.wait_notification(time.after_ms(300)) {
+        Ok(Some(note)) => print("unexpected notification")
+        Ok(None) => print("none after unlisten")
+        Err(e) => print("error {postgres.error_text(e)}")
+    }
+    listener.close()
+    c.close()
+}

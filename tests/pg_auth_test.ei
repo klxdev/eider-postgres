@@ -1,0 +1,113 @@
+// Every password method the server can ask for: SCRAM-SHA-256, MD5, cleartext, trust; wrong
+// passwords, a missing password, an unknown user and database, and the URL form of the config.
+
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.tests.util
+
+fn who(user: str, password: Option[String]) uses net, io, clock, fs {
+    var cfg = util.config(user, "x")
+    cfg.password = password
+    match client.connect(cfg, util.dl()) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            match c.query("SELECT current_user::text AS u", List.new(), util.dl()) {
+                Ok(rs) => print("{user}: connected as {codec.value(rs, 0, 0).unwrap()}")
+                Err(e) => print("{user}: query failed {postgres.error_text(e)}")
+            }
+            c.close()
+        }
+        Err(e) => print("{user}: {e.kind} {e.sqlstate} {e.message}")
+    }
+}
+
+fn main() uses net, io, clock, fs {
+    who("scram_user", Some(String.from("scram_pw")))
+    who("md5_user", Some(String.from("md5_pw")))
+    who("pw_user", Some(String.from("clear_pw")))
+    who("trust_user", None)
+    who("eider", Some(String.from("eider_pw")))
+    // wrong and missing passwords
+    who("scram_user", Some(String.from("wrong")))
+    who("md5_user", Some(String.from("wrong")))
+    who("pw_user", Some(String.from("wrong")))
+    who("scram_user", None)
+    who("md5_user", None)
+    who("nobody", Some(String.from("x")))
+    // an empty password
+    who("scram_user", Some(String.from("")))
+
+    // a database that does not exist
+    var cfg = util.config("eider", "eider_pw")
+    cfg.database = String.from("no_such_db")
+    match client.connect(cfg, util.dl()) {
+        Ok(c) => print("connected to a missing database?")
+        Err(e) => print("missing database: {e.kind} {e.sqlstate}")
+    }
+    // nothing listens there: refused, and a name that does not resolve
+    var dead = util.config("eider", "eider_pw")
+    dead.port = 1
+    match client.connect(dead, util.dl()) {
+        Ok(c) => print("connected to port 1?")
+        Err(e) => print("refused: {e.kind}")
+    }
+    var nowhere = util.config("eider", "eider_pw")
+    nowhere.host = String.from("no-such-host.invalid")
+    match client.connect(nowhere, util.dl()) {
+        Ok(c) => print("resolved?")
+        Err(e) => print("unresolvable: {e.kind}")
+    }
+
+    // this server has no TLS: prefer goes on in clear text, require and verify-full refuse
+    var pref = util.config("eider", "eider_pw")
+    pref.sslmode = postgres.Prefer
+    match client.connect(pref, util.dl()) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            print("prefer without server TLS: connected, encrypted {c.encrypted()}")
+            c.close()
+        }
+        Err(e) => print("prefer: {e.kind} {e.message}")
+    }
+    for mode in List[postgres.Require, postgres.VerifyFull] {
+        var need = util.config("eider", "eider_pw")
+        need.sslmode = mode
+        match client.connect(need, util.dl()) {
+            Ok(c) => print("{mode} connected without TLS?")
+            Err(e) => print("{mode} without server TLS: {e.kind}: {e.message}")
+        }
+    }
+
+    // startup parameters reach the server
+    var cfg2 = util.config("eider", "eider_pw")
+    cfg2.application_name = String.from("eider-pg-test-app")
+    cfg2.params.push((String.from("search_path"), String.from("pg_catalog")))
+    let mut c = client.connect(cfg2, util.dl()).unwrap()
+    let rs = c.query("SELECT current_setting('application_name') AS a, current_setting('search_path') AS s", List.new(), util.dl()).unwrap()
+    print("application_name {codec.value(rs, 0, 0).unwrap()} search_path {codec.value(rs, 0, 1).unwrap()}")
+    c.close()
+
+    // the URL form
+    match postgres.parse_url("postgres://u%40x:p%3Aw%2Fd@db.example.org:6543/my%20db?sslmode=verify-full&application_name=app&connect_timeout=7&search_path=a,b") {
+        Ok(cf) => {
+            print("url: user {cf.user} password {cf.password} host {cf.host} port {cf.port} db {cf.database}")
+            print("url: {cf.sslmode} app {cf.application_name} timeout {cf.connect_timeout_ms} params {cf.params}")
+        }
+        Err(e) => print("url error {postgres.error_text(e)}")
+    }
+    match postgres.parse_url("postgresql://[::1]:5433/d") {
+        Ok(cf) => print("url6: host {cf.host} port {cf.port} user {cf.user} db {cf.database}")
+        Err(e) => print("url error {postgres.error_text(e)}")
+    }
+    match postgres.parse_url("postgres://me@localhost") {
+        Ok(cf) => print("url bare: host {cf.host} port {cf.port} user {cf.user} db {cf.database} password {cf.password}")
+        Err(e) => print("url error {postgres.error_text(e)}")
+    }
+    for bad in List["mysql://x@y/z", "postgres://@h/d", "postgres://u@h:99999/d", "postgres://u@h:abc/d", "postgres://u@h/d?sslmode=maybe", "postgres://u%zz@h/d", "postgres://u@[::1/d"] {
+        match postgres.parse_url(bad) {
+            Ok(cf) => print("{bad}: accepted")
+            Err(e) => print("{bad}: {e.kind}")
+        }
+    }
+}

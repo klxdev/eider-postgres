@@ -1,0 +1,100 @@
+integers
+int2 bin: Int(-42)
+int4 bin: Int(-7)
+int4 max: Int(2147483647)
+int8 bin: Int(-9223372036854775808)
+int8 text: Int(-9223372036854775808)
+int4 wrong size: error integer: bad binary size
+int2 text overflow: error integer: bad text value
+int4 text junk: error integer: bad text value
+oid: Int(4294967295)
+bool, floats
+bool t: Bool(true)
+bool bad: error bool: bad binary value
+bool text: Bool(false)
+bool text bad: error bool: bad text value
+float8 bin: Float(2.5)
+float4 bin: Float(1.5)
+float8 nan: Float(NaN)
+float8 -inf: Float(-inf)
+float8 text: Float(-0.0015)
+float8 Infinity text: Float(inf)
+float4 wrong size: error float4: bad binary size
+text, bytea, uuid, json
+text: Text("héllo")
+varchar: Text("x")
+text invalid utf-8: error the cell is not valid UTF-8 text
+bytea bin: Bytes([0, 1, 255])
+bytea text: Bytes([0, 255, 16])
+bytea text odd: error bytea: bad hex
+bytea text escape form: error bytea: output is not in hex form (set bytea_output = 'hex')
+uuid bin: Uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+uuid wrong size: error uuid: bad binary size
+json: Json("[1, 2]")
+jsonb bin: Json("{}")
+jsonb bad version: error jsonb: bad version
+numeric
+12345.6789: Numeric("12345.6789")
+-0.001: Numeric("-0.001")
+0: Numeric("0")
+0.00: Numeric("0.00")
+10000: Numeric("10000")
+100000000.5: Numeric("100000000.5")
+0.0000123: Numeric("0.0000123")
+NaN: Numeric("NaN")
+Infinity: Numeric("Infinity")
+-Infinity: Numeric("-Infinity")
+bad digit: error numeric: bad digit
+negative digit: error numeric: bad digit
+bad sign: error numeric: bad sign
+ndigits beyond the data: error numeric: bad size
+huge weight: Null
+numeric text: Numeric("12.50")
+dates and times
+date bin 2026-11-05: Date(DateTime { year: 2026, month: 11, day: 5, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 })
+date bin 2000-01-01: Date(DateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 })
+date bin 1999-12-31: Date(DateTime { year: 1999, month: 12, day: 31, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 })
+date infinity: Raw(1082, false, [105, 110, 102, 105, 110, 105, 116, 121])
+date text: Raw(1082, false, [50, 48, 50, 54, 45, 48, 50, 45, 50, 57])
+timestamp bin epoch: Timestamp(DateTime { year: 2000, month: 1, day: 1, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 })
+timestamp bin negative: Timestamp(DateTime { year: 1999, month: 12, day: 31, hour: 23, minute: 59, second: 59, nanos: 999999000, offset_min: 0 })
+timestamptz bin: TimestampTz(DateTime { year: 2022, month: 11, day: 18, hour: 1, minute: 36, second: 27, nanos: 709056000, offset_min: 0 })
+timestamp infinity: Raw(1114, false, [105, 110, 102, 105, 110, 105, 116, 121])
+timestamp out of range: error timestamp out of range
+timestamp text: Timestamp(DateTime { year: 2026, month: 11, day: 5, hour: 13, minute: 45, second: 1, nanos: 123456000, offset_min: 0 })
+timestamp text no fraction: Timestamp(DateTime { year: 2026, month: 11, day: 5, hour: 13, minute: 45, second: 1, nanos: 0, offset_min: 0 })
+timestamptz text +02: TimestampTz(DateTime { year: 2026, month: 11, day: 5, hour: 13, minute: 45, second: 1, nanos: 500000000, offset_min: 120 })
+timestamptz text -05:30: TimestampTz(DateTime { year: 2026, month: 11, day: 5, hour: 13, minute: 45, second: 1, nanos: 0, offset_min: -330 })
+timestamptz text bad: Raw(1184, false, [50, 48, 50, 54, 45, 49, 51, 45, 48, 53, 32, 49, 51, 58, 52, 53, 58, 48, 49, 43, 48, 48])
+timestamp BC: Raw(1114, false, [48, 48, 52, 52, 45, 48, 51, 45, 49, 53, 32, 49, 50, 58, 48, 48, 58, 48, 48, 32, 66, 67])
+arrays and unknown types
+int4[]: Array([Int(1), Int(2), Null, Int(4)])
+empty: Array([])
+text[]: Array([Text("a"), Text("b c"), Text("q\"uote"), Null, Text("NULL")])
+nested: Array([Array([Int(1), Int(2)]), Array([Int(3), Int(4)])])
+lower bounds: Array([Int(7), Int(8)])
+bytea[]: Array([Bytes([0, 255])])
+array unterminated: error array: unterminated
+array junk: error integer: bad text value
+array empty element: error array: empty element
+array deep: error array: nested too deeply
+unknown type text: Raw(1186, false, [49, 32, 100, 97, 121])
+unknown type binary: Raw(1186, true, [1, 2])
+array binary is raw: Raw(1007, true, [1])
+parameters
+  Null -> oid 0 binary false data None
+  Bool(true) -> oid 0 binary false data Some([116])
+  Int(-5) -> oid 0 binary false data Some([45, 53])
+  Float(1.5) -> oid 0 binary false data Some([49, 46, 53])
+  Float(1.0) -> oid 0 binary false data Some([49, 46, 48])
+  Text("é") -> oid 0 binary false data Some([195, 169])
+  Bytes([1, 2]) -> oid 17 binary true data Some([1, 2])
+  Numeric("1.50") -> oid 0 binary false data Some([49, 46, 53, 48])
+  Uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11") -> oid 0 binary false data Some([97, 48, 101, 101, 98, 99, 57, 57, 45, 57, 99, 48, 98, 45, 52, 101, 102, 56, 45, 98, 98, 54, 100, 45, 54, 98, 98, 57, 98, 100, 51, 56, 48, 97, 49, 49])
+  Json("[]") -> oid 0 binary false data Some([91, 93])
+date 2026-11-05 timestamp 2026-11-05 13:45:01.123456 timestamptz 2026-11-05 13:45:01.123456+02:00
+negative offset 2026-01-02 03:04:05-05:30
+floats: Some([78, 97, 78]) Some([73, 110, 102, 105, 110, 105, 116, 121]) Some([45, 73, 110, 102, 105, 110, 105, 116, 121])
+array -> Some(26) {1,NULL,{"a\"b\\c",f,2.5}}
+raw in an array: Param
+result formats: int4 true text true numeric false json false timestamptz true

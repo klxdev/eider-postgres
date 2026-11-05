@@ -1,0 +1,387 @@
+//! postgres.typed: queries over records. Rows are read into any type with `Deserialize`
+//! (`@[derive(Deserialize)]`), and parameters are taken from any type with `Serialize`, through
+//! std/serial, the same machinery eider-json uses.
+//!
+//! ```
+//! @[derive(Serialize, Deserialize)]
+//! type User = { id: i64, @[serial(name = "full_name")] name: String, email: Option[String] }
+//!
+//! let users = typed.query[User](inout c, "SELECT id, full_name, email FROM users WHERE id > $1",
+//!                               List[postgres.Int(10)], dl)?
+//! typed.exec_with(inout c, "INSERT INTO users (id, full_name, email) VALUES ($1, $2, $3)", User(11, name, None), dl)?
+//! ```
+//!
+//! A row is read as a map from column names to values: field `name` takes the column `name` (or the
+//! `@[serial(name = ...)]` / `rename_all` key). Every mismatch is a `Decode` error naming the column:
+//! a missing column for a field that is not an `Option` (or `default`), a column no field takes
+//! (unless the type says `@[serial(unknown = "ignore")]`), a NULL for a field that is not an
+//! `Option`, a value of the wrong type or out of the field's range. The columns' types map to field
+//! types as follows: bool to `bool`; int2, int4, int8, oid to any integer type; float4, float8 and
+//! numeric to `f64`; numeric, text, varchar, uuid, json and jsonb to `String`; bytea to
+//! `serial.Bytes`; date, timestamp and timestamptz to `time.DateTime`; arrays to `List[T]`.
+//!
+//! Parameters: the fields of a record in order are `$1`, `$2`, ...; a `List[T]` is one parameter per
+//! element; a single scalar is `$1`. An `Option` that is `None` is NULL.
+
+import std.bytes
+import std.serial
+import std.strings
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+
+fn decode_error(e: serial.Error) -> postgres.Error {
+    postgres.error(postgres.Decode, postgres.text_of(serial.error_text(e)))
+}
+
+// ------------------------------------------------------------------------------ reading rows
+
+/// A cursor on a row, or on one of its cells (a `serial.Deserializer`).
+pub type RowReader = {
+    cols: List[postgres.Column],
+    cells: List[Option[List[u8]]],
+    col: i64,
+    path: List[u8],
+    val: postgres.Value,
+    err: Option[serial.Error]
+}
+
+/// A cursor on the whole row `row` of a result.
+pub fn row_reader(cols: List[postgres.Column], row: postgres.Row) -> RowReader {
+    RowReader(cols, row.cells, -1, List.new(), postgres.Null, None)
+}
+
+fn cell_reader(r: RowReader, i: usize) -> RowReader {
+    let c = r.cols[i]
+    let mut path = serial.path_field(r.path, c.name.bytes())
+    let cell = if i < r.cells.len() { r.cells[i] } else { None }
+    match codec.decode_cell(c.type_oid, c.format == 1, cell) {
+        Ok(v) => RowReader(r.cols, r.cells, i as i64, path, v, None)
+        Err(e) => RowReader(r.cols, r.cells, i as i64, path, postgres.Null, Some(serial.error_at(path.copy(), e.message.bytes())))
+    }
+}
+
+fn element_reader(r: RowReader, i: usize, v: postgres.Value) -> RowReader {
+    RowReader(r.cols, r.cells, r.col, serial.path_index(r.path, i), v, None)
+}
+
+fn found(r: RowReader) -> str {
+    match r.val {
+        postgres.Null => "null"
+        postgres.Bool(b) => "a boolean"
+        postgres.Int(n) => "an integer"
+        postgres.Float(f) => "a number"
+        postgres.Text(s) => "text"
+        postgres.Bytes(b) => "bytes"
+        postgres.Numeric(s) => "a numeric"
+        postgres.Uuid(s) => "a uuid"
+        postgres.Json(s) => "json"
+        postgres.Date(d) => "a date"
+        postgres.Timestamp(d) => "a timestamp"
+        postgres.TimestampTz(d) => "a timestamptz"
+        postgres.Array(a) => "an array"
+        postgres.Raw(o, b, d) => "a value of an unsupported type"
+    }
+}
+
+fn mismatch(r: RowReader, want: str) -> serial.Error {
+    let mut m = "expected ".bytes()
+    m.extend(want.bytes())
+    m.extend(", found ".bytes())
+    m.extend(found(r).bytes())
+    if r.col >= 0 && (r.col as usize) < r.cols.len() {
+        m.extend(" (column type ".bytes())
+        m.extend(String.from_int(r.cols[r.col as usize].type_oid as i64).bytes())
+        m.extend(")".bytes())
+    }
+    serial.error_at(r.path.copy(), m)
+}
+
+fn fail_if(r: RowReader) -> Result[(), serial.Error] {
+    match r.err {
+        Some(e) => Err(e)
+        None => Ok(())
+    }
+}
+
+impl serial.Deserializer for RowReader {
+    fn format(self) -> str { "postgres" }
+    fn path(self) -> List[u8] { self.path.copy() }
+    fn kind(self) -> serial.Kind {
+        if self.col < 0 { return serial.KMap }
+        match self.val {
+            postgres.Null => serial.KNull
+            postgres.Bool(b) => serial.KBool
+            postgres.Int(n) => serial.KInt
+            postgres.Float(f) => serial.KFloat
+            postgres.Bytes(b) => serial.KBytes
+            postgres.Date(d) => serial.KTime
+            postgres.Timestamp(d) => serial.KTime
+            postgres.TimestampTz(d) => serial.KTime
+            postgres.Array(a) => serial.KList
+            _ => serial.KStr
+        }
+    }
+    fn read_bool(self) -> Result[bool, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Bool(b) => Ok(b)
+            _ => Err(mismatch(self, "a boolean"))
+        }
+    }
+    fn read_i64(self) -> Result[i64, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Int(n) => Ok(n)
+            _ => Err(mismatch(self, "an integer"))
+        }
+    }
+    fn read_u64(self) -> Result[u64, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Int(n) => {
+                if n < 0 { return Err(serial.fail(self, "the number is out of range")) }
+                Ok(n as u64)
+            }
+            _ => Err(mismatch(self, "an integer"))
+        }
+    }
+    fn read_f64(self) -> Result[f64, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Float(f) => Ok(f)
+            postgres.Int(n) => Ok(n as f64)
+            postgres.Numeric(s) => {
+                match codec.parse_float(s) {
+                    Some(f) => Ok(f)
+                    None => Err(serial.fail(self, "the numeric is not a number"))
+                }
+            }
+            _ => Err(mismatch(self, "a number"))
+        }
+    }
+    fn read_string(self) -> Result[List[u8], serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Text(s) => Ok(s.bytes())
+            postgres.Numeric(s) => Ok(s.bytes())
+            postgres.Uuid(s) => Ok(s.bytes())
+            postgres.Json(s) => Ok(s.bytes())
+            postgres.Raw(oid, binary, data) => {
+                if binary { return Err(mismatch(self, "text")) }
+                match String.from_bytes(data) {
+                    Ok(s) => Ok(s.bytes())
+                    Err(_) => Err(mismatch(self, "text"))
+                }
+            }
+            _ => Err(mismatch(self, "text"))
+        }
+    }
+    fn read_bytes(self) -> Result[List[u8], serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Bytes(b) => Ok(b)
+            _ => Err(mismatch(self, "bytes"))
+        }
+    }
+    fn read_time(self) -> Result[time.DateTime, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Date(d) => Ok(d)
+            postgres.Timestamp(d) => Ok(d)
+            postgres.TimestampTz(d) => Ok(d)
+            _ => Err(mismatch(self, "a time"))
+        }
+    }
+    fn len(self) -> usize {
+        if self.col < 0 { return self.cols.len() }
+        match self.val {
+            postgres.Array(a) => a.len()
+            _ => 0
+        }
+    }
+    fn at(self, i: usize) -> Result[RowReader, serial.Error] {
+        fail_if(self)?
+        match self.val {
+            postgres.Array(a) => {
+                if i >= a.len() { return Err(serial.fail(self, "no such element")) }
+                Ok(element_reader(self, i, a[i]))
+            }
+            _ => Err(serial.expected(self, "a list"))
+        }
+    }
+    fn get(self, key: List[u8]) -> Option[RowReader] {
+        if self.col >= 0 { return None }
+        let mut i: usize = 0
+        while i < self.cols.len() {
+            if bytes.eq(self.cols[i].name.bytes(), key) { return Some(cell_reader(self, i)) }
+            i += 1
+        }
+        None
+    }
+    fn key_at(self, i: usize) -> List[u8] {
+        if i < self.cols.len() { return self.cols[i].name.bytes() }
+        List.new()
+    }
+    fn value_at(self, i: usize) -> RowReader { cell_reader(self, i) }
+}
+
+/// Reads row `i` of `rs` as a `T`.
+pub fn decode_row[T: serial.Deserialize](rs: postgres.Rows, i: usize) -> Result[T, postgres.Error] {
+    if i >= rs.rows.len() { return Err(postgres.fail(postgres.Decode, "no such row")) }
+    match T.deserialize(row_reader(rs.columns, rs.rows[i])) {
+        Ok(x) => Ok(x)
+        Err(e) => Err(decode_error(e))
+    }
+}
+
+/// Reads every row of `rs` as a `T`. The error is the first row's that does not fit, with its row
+/// number in the message.
+pub fn decode_rows[T: serial.Deserialize](rs: postgres.Rows) -> Result[List[T], postgres.Error] {
+    let mut out: List[T] = List.new()
+    let mut i: usize = 0
+    while i < rs.rows.len() {
+        match T.deserialize(row_reader(rs.columns, rs.rows[i])) {
+            Ok(x) => { out.push(x) }
+            Err(e) => {
+                var pe = decode_error(e)
+                var m = String.from("row ")
+                m.append(String.from_int(i as i64))
+                m.push_str(": ")
+                m.append(pe.message.copy())
+                pe.message = m
+                return Err(pe)
+            }
+        }
+        i += 1
+    }
+    Ok(out)
+}
+
+/// Runs `sql` with `params` and reads the rows as `T`s.
+pub fn query[T: serial.Deserialize, A: strings.Text](inout c: client.Conn, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[List[T], postgres.Error] uses net, io, clock {
+    let rs = c.query(sql, params, dl)?
+    decode_rows[T](rs)
+}
+
+/// `query` for exactly one row: an error when there are none or several.
+pub fn query_one[T: serial.Deserialize, A: strings.Text](inout c: client.Conn, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[T, postgres.Error] uses net, io, clock {
+    let rs = c.query(sql, params, dl)?
+    if rs.rows.len() != 1 {
+        let mut m = String.from("expected one row, got ")
+        m.append(String.from_int(rs.rows.len() as i64))
+        return Err(postgres.error(postgres.Decode, m))
+    }
+    decode_row[T](rs, 0)
+}
+
+/// `query` for at most one row: `None` when there are none, an error when there are several.
+pub fn query_opt[T: serial.Deserialize, A: strings.Text](inout c: client.Conn, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[Option[T], postgres.Error] uses net, io, clock {
+    let rs = c.query(sql, params, dl)?
+    if rs.rows.len() == 0 { return Ok(None) }
+    if rs.rows.len() > 1 {
+        let mut m = String.from("expected at most one row, got ")
+        m.append(String.from_int(rs.rows.len() as i64))
+        return Err(postgres.error(postgres.Decode, m))
+    }
+    let x = decode_row[T](rs, 0)?
+    Ok(Some(x))
+}
+
+// -------------------------------------------------------------------------------- parameters
+
+/// Collects what a `Serialize` type writes as parameters.
+pub type ParamWriter = { out: List[postgres.Value], arrays: List[List[postgres.Value]], depth: u32 }
+
+pub fn param_writer() -> ParamWriter { ParamWriter(List.new(), List.new(), 0) }
+
+fn pfail(m: str) -> serial.Error { serial.error(m) }
+
+impl ParamWriter {
+    fn put(inout self, v: postgres.Value) -> Result[(), serial.Error] {
+        if self.arrays.len() > 0 {
+            let n = self.arrays.len()
+            self.arrays[n - 1].push(v)
+        } else {
+            self.out.push(v)
+        }
+        Ok(())
+    }
+}
+
+impl serial.Serializer for ParamWriter {
+    fn format(self) -> str { "postgres" }
+    fn bool(inout self, v: bool) -> Result[(), serial.Error] { self.put(postgres.Bool(v)) }
+    fn int(inout self, v: i64) -> Result[(), serial.Error] { self.put(postgres.Int(v)) }
+    fn uint(inout self, v: u64) -> Result[(), serial.Error] {
+        if v > 9223372036854775807 { return self.put(postgres.Numeric(String.from_bytes(bytes.from_u64(v)).unwrap())) }
+        self.put(postgres.Int(v as i64))
+    }
+    fn float(inout self, v: f64) -> Result[(), serial.Error] { self.put(postgres.Float(v)) }
+    fn string(inout self, v: List[u8]) -> Result[(), serial.Error] {
+        match String.from_bytes(v) {
+            Ok(s) => self.put(postgres.Text(s))
+            Err(_) => Err(pfail("text parameter is not valid"))
+        }
+    }
+    fn bytes(inout self, v: List[u8]) -> Result[(), serial.Error] { self.put(postgres.Bytes(v)) }
+    fn time(inout self, v: time.DateTime) -> Result[(), serial.Error] { self.put(postgres.TimestampTz(v)) }
+    fn none(inout self) -> Result[(), serial.Error] { self.put(postgres.Null) }
+    fn begin_list(inout self, len: usize) -> Result[(), serial.Error] {
+        if self.depth == 0 && self.arrays.len() == 0 {
+            // the parameters themselves
+            self.depth = 1
+            return Ok(())
+        }
+        self.arrays.push(List.new())
+        Ok(())
+    }
+    fn end_list(inout self) -> Result[(), serial.Error] {
+        if self.arrays.len() == 0 {
+            self.depth = 0
+            return Ok(())
+        }
+        let items = self.arrays.pop().unwrap()
+        self.put(postgres.Array(items))
+    }
+    fn begin_map(inout self, len: usize) -> Result[(), serial.Error] { Err(pfail("a map cannot be a parameter")) }
+    fn key(inout self, k: List[u8]) -> Result[(), serial.Error] { Err(pfail("a map cannot be a parameter")) }
+    fn end_map(inout self) -> Result[(), serial.Error] { Err(pfail("a map cannot be a parameter")) }
+    fn begin_record(inout self, len: usize) -> Result[(), serial.Error] {
+        if self.depth != 0 || self.arrays.len() > 0 { return Err(pfail("a record cannot be a parameter value; flatten it into the parameters")) }
+        self.depth = 1
+        Ok(())
+    }
+    fn field(inout self, name: List[u8]) -> Result[(), serial.Error] { Ok(()) }
+    fn end_record(inout self) -> Result[(), serial.Error] {
+        self.depth = 0
+        Ok(())
+    }
+    fn begin_variant(inout self, name: List[u8], tag: List[u8], len: usize) -> Result[(), serial.Error] {
+        Err(pfail("an enum with fields cannot be a parameter"))
+    }
+    fn end_variant(inout self) -> Result[(), serial.Error] { Err(pfail("an enum with fields cannot be a parameter")) }
+    fn merge_next(inout self) -> Result[(), serial.Error] { Err(pfail("a flattened record cannot be a parameter")) }
+}
+
+/// The parameters of `p`: the fields of a record in order, the elements of a list, or one scalar.
+pub fn params[P: serial.Serialize](p: P) -> Result[List[postgres.Value], postgres.Error] {
+    let mut w = param_writer()
+    match p.serialize(inout w) {
+        Ok(_) => Ok(w.out)
+        Err(e) => Err(postgres.error(postgres.Param, postgres.text_of(serial.error_text(e))))
+    }
+}
+
+/// `query` with the parameters taken from `p`.
+pub fn query_with[T: serial.Deserialize, P: serial.Serialize, A: strings.Text](inout c: client.Conn, sql: A, p: P, dl: time.Deadline) -> Result[List[T], postgres.Error] uses net, io, clock {
+    let ps = params(p)?
+    query[T](inout c, sql, ps, dl)
+}
+
+/// A command with the parameters taken from `p`: the number of rows it affected.
+pub fn exec_with[P: serial.Serialize, A: strings.Text](inout c: client.Conn, sql: A, p: P, dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock {
+    let ps = params(p)?
+    c.exec(sql, ps, dl)
+}

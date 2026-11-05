@@ -1,0 +1,103 @@
+// Round trips and row decoding against a real server: scripts/bench.sh starts one.
+//
+//   sh scripts/bench.sh [N]       (N round trips, default 5000)
+
+import std.env
+import std.serial
+import std.strings
+import std.time
+import postgres
+import postgres.client
+import postgres.codec
+import postgres.pool
+import postgres.typed
+
+@[derive(Deserialize)]
+type Item = { n: i64, label: String, price: f64 }
+
+fn port() -> i32 uses io {
+    match env.get("EIDER_PG_PORT".bytes()) {
+        Some(p) => strings.parse_i32(String.from_bytes(p).unwrap()).unwrap_or(55432)
+        None => 55432
+    }
+}
+
+fn rate(count: i64, ms: i64) -> i64 { if ms <= 0 { 0 } else { count * 1000 / ms } }
+
+fn main() uses net, io, clock, fs, threads {
+    var count: i64 = 5000
+    let args = env.args()
+    if args.len() > 1 { count = strings.parse_i64(String.from_bytes(args[1]).unwrap()).unwrap_or(5000) }
+    var cfg = postgres.config("127.0.0.1", "eider", "eiderdb")
+    cfg.port = port()
+    cfg.password = Some(String.from("eider_pw"))
+    cfg.sslmode = postgres.Disable
+    let dl = time.after_ms(600000)
+    let mut c = client.connect(cfg, dl).unwrap()
+
+    // simple protocol, extended with the statement cache, extended with a parameter
+    let t0 = time.mono_ms()
+    for i in 0..count { let r = c.simple("SELECT 1", dl).unwrap() }
+    let t1 = time.mono_ms()
+    print("simple SELECT 1:           {rate(count, t1 - t0)} round trips/s")
+    for i in 0..count { let r = c.query("SELECT 1", List.new(), dl).unwrap() }
+    let t2 = time.mono_ms()
+    print("extended SELECT 1 (cache): {rate(count, t2 - t1)} round trips/s")
+    for i in 0..count { let r = c.query("SELECT $1::int8 + 1", List[postgres.Int(i)], dl).unwrap() }
+    let t3 = time.mono_ms()
+    print("extended with a parameter: {rate(count, t3 - t2)} round trips/s")
+    let z = c.execute("CREATE TEMP TABLE bench_t (id bigint PRIMARY KEY, v text)", dl).unwrap()
+    let t3b = time.mono_ms()
+    for i in 0..count { let r = c.exec("INSERT INTO bench_t VALUES ($1, $2)", List[postgres.Int(i), postgres.Text(String.from("value"))], dl).unwrap() }
+    let t3c = time.mono_ms()
+    print("INSERT (autocommit):       {rate(count, t3c - t3b)} statements/s")
+    let n = c.exec("DELETE FROM bench_t", List.new(), dl).unwrap()
+
+    // rows
+    let rows: i64 = 200000
+    let t4 = time.mono_ms()
+    let rs = c.query("SELECT g::int8 AS n, 'item ' || g AS label, (g * 0.25)::float8 AS price FROM generate_series(1, 200000) g", List.new(), dl).unwrap()
+    let t5 = time.mono_ms()
+    print("fetch {rs.rows.len()} rows x 3 columns:   {rate(rows, t5 - t4)} rows/s (cells kept as bytes)")
+    let items = typed.decode_rows[Item](rs).unwrap()
+    let t6 = time.mono_ms()
+    print("decode into records:       {rate(rows, t6 - t5)} rows/s ({items.len()} records)")
+    let mut sum: f64 = 0.0
+    for r in 0..rs.rows.len() {
+        match codec.value(rs, r, 2) {
+            Ok(postgres.Float(f)) => { sum += f }
+            _ => {}
+        }
+    }
+    let t7 = time.mono_ms()
+    print("decode one column to Value: {rate(rows, t7 - t6)} rows/s (sum {sum})")
+    let wide = c.query("SELECT repeat('x', 100) AS a, repeat('y', 100) AS b, g::int8 AS c, g::int8 AS d, g::int8 AS e, now() AS f FROM generate_series(1, 100000) g", List.new(), dl).unwrap()
+    let t8 = time.mono_ms()
+    print("fetch 100000 rows x 6 columns: {rate(100000, t8 - t7)} rows/s")
+    c.close()
+
+    // the pool: tasks sharing 4 connections
+    var pc = pool.pool_config()
+    pc.max = 4
+    let p = pool.new(cfg, pc, dl).unwrap()
+    let per: i64 = count / 4
+    let t9 = time.mono_ms()
+    let mut tasks: List[Task[i64]] = List.new()
+    for w in 0..16 {
+        tasks.push(spawn(|| -> i64 {
+            let mut done: i64 = 0
+            for i in 0..(per / 4) {
+                match pool.query(p, "SELECT 1", List.new(), time.after_ms(600000)) {
+                    Ok(r) => { done += 1 }
+                    Err(e) => {}
+                }
+            }
+            done
+        }))
+    }
+    let mut total: i64 = 0
+    for t in tasks { total += t.join() }
+    let t10 = time.mono_ms()
+    print("pool, 16 tasks on 4 connections: {rate(total, t10 - t9)} queries/s")
+    pool.close(p)
+}

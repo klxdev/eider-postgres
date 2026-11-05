@@ -1,0 +1,19 @@
+in tx: true
+after rollback: 0, in tx false
+after commit: 1
+dup: 23505
+failed transaction: true
+in a failed transaction: 25P02 current transaction is aborted, commands ignored until end of transaction block
+recovered: in tx false, count 1
+rolled back to the savepoint: 2
+after the savepoints: 3
+savepoint name: Usage
+transaction ok: 7, count 5
+transaction err: 23505
+rolled back: count 5, in tx false, usable true
+application error: changed my mind, count 5
+inner: inner failed
+nested: 1, count 7
+Int(1) Int(10) Int(12) Int(20) Int(21) Int(50) Int(52) 
+trap: Closed, usable false
+rolled back by the trap: count 7

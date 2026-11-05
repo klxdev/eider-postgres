@@ -1,0 +1,189 @@
+//! postgres.scram: SCRAM-SHA-256 (RFC 5802 and RFC 7677) as PostgreSQL uses it, over the
+//! crypto package's SHA-256 and HMAC. Pure functions: `postgres.client` runs the exchange.
+//!
+//! The username in the client-first message is empty, as libpq sends it (the server takes the
+//! user from the startup message). The password is used as its UTF-8 bytes, which is SASLprep
+//! (RFC 4013) for ASCII; a password with characters that SASLprep maps or normalizes is not
+//! prepared here (PostgreSQL itself falls back to the raw bytes for text that SASLprep refuses).
+//! The server's final signature is always checked, so a server that does not know the password
+//! (a man in the middle) fails the exchange.
+
+import std.bytes
+import std.encoding
+import std.strings
+import crypto
+import postgres
+
+/// The mechanism name for the SASL messages.
+pub const MECHANISM: str = "SCRAM-SHA-256"
+
+/// The largest iteration count accepted from a server (PostgreSQL's default is 4096): a hostile
+/// server could ask for billions.
+pub const MAX_ITERATIONS: u32 = 1000000
+
+fn auth_fail(m: str) -> postgres.Error { postgres.fail(postgres.Auth, m) }
+
+fn crypto_fail(e: crypto.Error) -> postgres.Error {
+    let mut m = String.from("SCRAM: ")
+    m.append(crypto.error_text(e))
+    postgres.error(postgres.Auth, m)
+}
+
+fn hmac(key: List[u8], msg: List[u8]) -> Result[List[u8], postgres.Error] {
+    match crypto.hmac(crypto.hmac_key(crypto.Sha256, key), msg) {
+        Ok(t) => Ok(t.bytes)
+        Err(e) => Err(crypto_fail(e))
+    }
+}
+
+/// PBKDF2 with HMAC-SHA-256 and a single 32-byte block (the "Hi" function of RFC 5802).
+pub fn salted_password(password: List[u8], salt: List[u8], iterations: u32) -> Result[List[u8], postgres.Error] {
+    let k = crypto.hmac_key(crypto.Sha256, password)
+    let mut first = salt.copy()
+    first.push(0)
+    first.push(0)
+    first.push(0)
+    first.push(1)
+    let mut u = match crypto.hmac(k, first) {
+        Ok(t) => t.bytes
+        Err(e) => { return Err(crypto_fail(e)) }
+    }
+    let mut acc = u.copy()
+    let mut i: u32 = 1
+    while i < iterations {
+        u = match crypto.hmac(k, u) {
+            Ok(t) => t.bytes
+            Err(e) => { return Err(crypto_fail(e)) }
+        }
+        let mut j: usize = 0
+        while j < acc.len() {
+            acc[j] = acc[j] ^ u[j]
+            j += 1
+        }
+        i += 1
+    }
+    Ok(acc)
+}
+
+/// The client's side of an exchange in progress.
+pub type Client = { nonce: String, bare: String }
+
+/// Starts an exchange with this client nonce (random printable text without commas; see
+/// `random_nonce`). Returns the state and the client-first message.
+pub fn first(nonce: String) -> (Client, List[u8]) {
+    let mut bare = String.from("n=,r=")
+    bare.append(nonce.copy())
+    let mut msg = "n,,".bytes()
+    msg.extend(bare.bytes())
+    (Client(nonce, bare), msg)
+}
+
+/// A fresh nonce: 24 random bytes in base64 (the alphabet has no comma).
+pub fn random_nonce() -> Result[String, postgres.Error] uses io {
+    match crypto.random_bytes(24) {
+        Ok(b) => Ok(encoding.base64(b))
+        Err(e) => Err(crypto_fail(e))
+    }
+}
+
+/// The client-final message and the server signature the exchange must end with.
+pub type Final = { message: List[u8], server_signature: List[u8] }
+
+fn attr(parts: List[String], key: u8) -> Option[String] {
+    for p in parts {
+        if p.len() >= 2 && p.byte(0) == key && p.byte(1) == 61 { return Some(p.slice(2, p.len())) }
+    }
+    None
+}
+
+/// Answers the server-first message (`r=<nonce>,s=<salt>,i=<count>`). Checks that the server's
+/// nonce extends ours, the salt is base64 and the count is between 1 and `MAX_ITERATIONS`.
+pub fn respond(c: Client, password: String, server_first: List[u8]) -> Result[Final, postgres.Error] {
+    let text = match String.from_bytes(server_first) {
+        Ok(t) => t
+        Err(_) => { return Err(auth_fail("SCRAM: the server-first message is not text")) }
+    }
+    let parts = strings.split(text, ",")
+    if parts.len() > 0 && parts[0].len() >= 2 && parts[0].byte(0) == 109 && parts[0].byte(1) == 61 {
+        return Err(auth_fail("SCRAM: the server requires an extension this client does not know"))
+    }
+    let nonce = match attr(parts, 114) {
+        Some(n) => n
+        None => { return Err(auth_fail("SCRAM: no nonce in the server-first message")) }
+    }
+    if nonce.len() <= c.nonce.len() || !strings.starts_with(nonce, c.nonce) {
+        return Err(auth_fail("SCRAM: the server's nonce does not extend the client's"))
+    }
+    let salt_text = match attr(parts, 115) {
+        Some(n) => n
+        None => { return Err(auth_fail("SCRAM: no salt in the server-first message")) }
+    }
+    let salt = match encoding.unbase64(salt_text.bytes()) {
+        Ok(s) => s
+        Err(_) => { return Err(auth_fail("SCRAM: the salt is not base64")) }
+    }
+    if salt.len() == 0 || salt.len() > 1024 { return Err(auth_fail("SCRAM: the salt has an unusable length")) }
+    let count_text = match attr(parts, 105) {
+        Some(n) => n
+        None => { return Err(auth_fail("SCRAM: no iteration count in the server-first message")) }
+    }
+    let iterations = match strings.parse_u32(count_text) {
+        Ok(n) => n
+        Err(_) => { return Err(auth_fail("SCRAM: the iteration count is not a number")) }
+    }
+    if iterations < 1 || iterations > MAX_ITERATIONS { return Err(auth_fail("SCRAM: the iteration count is out of range")) }
+
+    let salted = salted_password(password.bytes(), salt, iterations)?
+    let client_key = hmac(salted, "Client Key".bytes())?
+    let stored_key = crypto.sha256(client_key)
+    let mut without_proof = "c=biws,r=".bytes()
+    without_proof.extend(nonce.bytes())
+    let mut auth_message = c.bare.bytes()
+    auth_message.push(44)
+    auth_message.extend(server_first)
+    auth_message.push(44)
+    auth_message.extend(without_proof)
+    let client_sig = hmac(stored_key, auth_message)?
+    let mut proof = client_key.copy()
+    let mut i: usize = 0
+    while i < proof.len() {
+        proof[i] = proof[i] ^ client_sig[i]
+        i += 1
+    }
+    let server_key = hmac(salted, "Server Key".bytes())?
+    let server_sig = hmac(server_key, auth_message)?
+    let mut msg = without_proof.copy()
+    msg.extend(",p=".bytes())
+    msg.extend(encoding.base64(proof).bytes())
+    Ok(Final(msg, server_sig))
+}
+
+/// Checks the server-final message (`v=<signature>`) against the signature computed in `respond`.
+/// An `e=` attribute is the server's refusal.
+pub fn verify(server_final: List[u8], expected: List[u8]) -> Result[(), postgres.Error] {
+    let text = match String.from_bytes(server_final) {
+        Ok(t) => t
+        Err(_) => { return Err(auth_fail("SCRAM: the server-final message is not text")) }
+    }
+    let parts = strings.split(text, ",")
+    match attr(parts, 101) {
+        Some(e) => {
+            let mut m = String.from("SCRAM: the server refused the proof: ")
+            m.append(e)
+            return Err(postgres.error(postgres.Auth, m))
+        }
+        None => {}
+    }
+    let v = match attr(parts, 118) {
+        Some(v) => v
+        None => { return Err(auth_fail("SCRAM: no signature in the server-final message")) }
+    }
+    let sig = match encoding.unbase64(v.bytes()) {
+        Ok(s) => s
+        Err(_) => { return Err(auth_fail("SCRAM: the server signature is not base64")) }
+    }
+    if !crypto.ct_equal(sig, expected) {
+        return Err(auth_fail("SCRAM: the server's signature is wrong (it does not know the password)"))
+    }
+    Ok(())
+}

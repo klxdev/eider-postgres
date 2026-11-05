@@ -1,0 +1,1051 @@
+//! postgres.client: a connection to a PostgreSQL server.
+//!
+//! `connect(cfg, dl)` resolves the host, connects, negotiates TLS (`Config.sslmode`),
+//! authenticates (cleartext, MD5 and SCRAM-SHA-256) and returns a `Conn`. A `Conn` is a value that
+//! one task uses at a time (`inout`); a pool (`postgres.pool`) hands them out to tasks.
+//!
+//! - `query(sql, params, dl)` runs one statement with parameters (`$1`, `$2`, ...) through the
+//!   extended protocol: Parse and Describe on first use, then Bind, Execute and Sync in one round
+//!   trip. Statements are kept per connection, keyed by their text and parameter types
+//!   (`Config.cache_size`), so a repeated query is one round trip. `exec` returns the affected row
+//!   count, `simple` runs text with several statements and no parameters (the simple protocol).
+//! - `begin`, `commit`, `rollback`, `savepoint`, `release`, `rollback_to`, and `transaction`, which
+//!   runs a function between BEGIN and COMMIT and rolls back when it returns `Err` or traps.
+//! - `copy_in` and `copy_out` for COPY FROM STDIN and TO STDOUT; `listen`, `notify` and
+//!   `wait_notification`.
+//! - Deadlines: every call that waits takes a `time.Deadline`. When one passes during a query the
+//!   connection sends a CancelRequest on a second socket (`cancel`), lets the server answer for
+//!   `Config.cancel_grace_ms`, and returns a `Timeout` error; the connection is `usable` again
+//!   if the server answered. Any `Io`, `Protocol` or `Closed` error leaves it unusable.
+//!
+//! A server is not trusted: messages are length-checked (`Config.max_message`,
+//! `Config.max_result_bytes`) and decoded strictly (`postgres.wire`), and a malformed one is a
+//! `Protocol` error.
+
+import std.bytes
+import std.encoding
+import std.net
+import std.stream
+import std.strings
+import std.task
+import std.time
+import postgres
+import postgres.codec
+import postgres.md5
+import postgres.scram
+import postgres.secure
+import postgres.wire
+
+const READY: u8 = 0
+const BROKEN: u8 = 1
+
+/// A statement the server has parsed: its name there, the parameter types it settled on and the
+/// result columns (with the format each is fetched in).
+pub type Prepared = { name: String, param_oids: List[u32], columns: List[postgres.Column] }
+
+/// What another task needs to cancel the query a connection is running (`cancel`).
+pub type CancelKey = { addr: net.Addr, pid: i32, secret: List[u8] }
+
+pub type Conn = {
+    link: secure.Link,
+    addr: net.Addr,
+    cfg: postgres.Config,
+    inbuf: List[u8],
+    inpos: usize,
+    pid: i32,
+    secret: List[u8],
+    /// The last ReadyForQuery status: 73 idle, 84 in a transaction, 69 in a failed transaction.
+    status: u8,
+    state: u8,
+    params: Map[String, String],
+    cache: Map[String, Prepared],
+    order: List[String],
+    next_stmt: u64,
+    to_close: List[String],
+    notices: List[postgres.Error],
+    notifications: List[postgres.Notification],
+    sp_depth: u32
+}
+
+fn closed_error() -> postgres.Error {
+    postgres.fail(postgres.Closed, "the connection is closed or unusable after an earlier error")
+}
+
+fn new_conn(link: secure.Link, addr: net.Addr, cfg: postgres.Config) -> Conn {
+    var c = cfg.copy()
+    // the password is not kept: nothing needs it after the handshake
+    Conn(link, addr, c, List.new(), 0, 0, List.new(), 73, READY, Map.new(), Map.new(), List.new(), 1, List.new(), List.new(), List.new(), 0)
+}
+
+/// How many rows a command tag counts: the last number of "INSERT 0 5", "SELECT 3", "COPY 7".
+fn affected(tag: String) -> u64 {
+    let parts = strings.split(tag, " ")
+    if parts.len() < 2 { return 0 }
+    match strings.parse_u64(parts[parts.len() - 1]) {
+        Ok(n) => n
+        Err(_) => 0
+    }
+}
+
+fn is_ident(name: String) -> bool {
+    let b = name.bytes()
+    if b.len() == 0 || b.len() > 63 { return false }
+    if !(bytes.is_alpha(b[0]) || b[0] == 95) { return false }
+    for c in b {
+        if !bytes.is_ident(c) { return false }
+    }
+    true
+}
+
+/// `name` as a quoted identifier: double quotes around it, a double quote doubled.
+pub fn quote_ident(name: String) -> String {
+    let mut o: List[u8] = List.new()
+    o.push(34)
+    for c in name.bytes() {
+        if c == 34 { o.push(34) }
+        o.push(c)
+    }
+    o.push(34)
+    postgres.text_of(o)
+}
+
+fn stale(e: postgres.Error) -> bool {
+    if e.kind != postgres.Server { return false }
+    if e.sqlstate == String.from("26000") { return true }
+    e.sqlstate == String.from("0A000") && strings.contains(e.message, "cached plan must not change result type")
+}
+
+/// Cancels the query running on the connection `key` names: opens a second connection, sends a
+/// CancelRequest and waits for the server to close it (so the request has been handled). The
+/// server may ignore it (the query may already be over); a cancelled query fails with SQLSTATE
+/// 57014.
+pub fn cancel(key: CancelKey, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+    let mut f = match stream.connect_by(key.addr, dl) {
+        Ok(f) => f
+        Err(e) => { return Err(postgres.error(if e.kind == stream.TimedOut { postgres.Timeout } else { postgres.Io }, e.message)) }
+    }
+    let sent = stream.write_all_by(inout f, wire.cancel_request(key.pid, key.secret), dl)
+    match sent {
+        Ok(_) => {}
+        Err(e) => {
+            let z = f.close()
+            return Err(postgres.error(if e.kind == stream.TimedOut { postgres.Timeout } else { postgres.Io }, e.message))
+        }
+    }
+    while true {
+        match f.read_by(16, dl) {
+            Ok(b) => { if b.len() == 0 { break } }
+            Err(e) => { break }
+        }
+    }
+    let z = f.close()
+    Ok(())
+}
+
+impl Conn {
+    /// Whether the connection can run another statement.
+    fn usable(self) -> bool { self.state == READY }
+
+    /// Whether a transaction is open (also a failed one).
+    fn in_transaction(self) -> bool { self.status != 73 }
+
+    /// Whether the open transaction has failed and only ROLLBACK is accepted.
+    fn transaction_failed(self) -> bool { self.status == 69 }
+
+    fn backend_pid(self) -> i32 { self.pid }
+
+    fn encrypted(self) -> bool { secure.encrypted(self.link) }
+
+    /// A server parameter reported at startup or when it changed (`server_version`,
+    /// `TimeZone`, `client_encoding`, ...).
+    fn parameter(self, name: str) -> Option[String] { self.params.get(String.from(name)) }
+
+    fn server_version(self) -> String {
+        match self.params.get(String.from("server_version")) {
+            Some(v) => v
+            None => String.from("")
+        }
+    }
+
+    fn cancel_key(self) -> CancelKey { CancelKey(self.addr, self.pid, self.secret) }
+
+    /// The notices (warnings and the like) the server sent since the last call.
+    fn take_notices(inout self) -> List[postgres.Error] {
+        let n = self.notices.copy()
+        self.notices.clear()
+        n
+    }
+
+    /// The NOTIFY messages received since the last call.
+    fn take_notifications(inout self) -> List[postgres.Notification] {
+        let n = self.notifications.copy()
+        self.notifications.clear()
+        n
+    }
+
+    /// How many statements are cached on this connection.
+    fn cached_statements(self) -> usize { self.cache.len() }
+
+    // ------------------------------------------------------------------ transport
+
+    fn mark_broken(inout self) { self.state = BROKEN }
+
+    fn fill(inout self, dl: time.Deadline) -> Result[(), postgres.Error] uses io, clock {
+        if self.inpos > 0 && self.inpos == self.inbuf.len() {
+            self.inbuf.clear()
+            self.inpos = 0
+        } else if self.inpos > 65536 {
+            self.inbuf.remove_range(0, self.inpos)
+            self.inpos = 0
+        }
+        match secure.read(inout self.link, 65536, dl) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Closed, "the server closed the connection"))
+                }
+                self.inbuf.extend(b)
+                Ok(())
+            }
+            Err(e) => {
+                if e.kind != postgres.Timeout { self.state = BROKEN }
+                Err(e)
+            }
+        }
+    }
+
+    fn send(inout self, data: List[u8], dl: time.Deadline) -> Result[(), postgres.Error] uses io, clock {
+        match secure.write(inout self.link, data, dl) {
+            Ok(_) => Ok(())
+            Err(e) => {
+                // some of the message may have been sent: the stream is out of step
+                self.state = BROKEN
+                Err(e)
+            }
+        }
+    }
+
+    /// The next message from the server, whatever it is.
+    fn read_msg(inout self, dl: time.Deadline) -> Result[wire.Backend, postgres.Error] uses io, clock {
+        while true {
+            match wire.frame(self.inbuf, self.inpos, self.cfg.max_message) {
+                wire.Frame(tag, body, used) => {
+                    self.inpos += used
+                    match wire.decode(tag, body) {
+                        Ok(m) => { return Ok(m) }
+                        Err(e) => {
+                            self.state = BROKEN
+                            return Err(e)
+                        }
+                    }
+                }
+                wire.NeedMore(n) => { self.fill(dl)? }
+                wire.BadFrame(e) => {
+                    self.state = BROKEN
+                    return Err(e)
+                }
+            }
+        }
+        Err(closed_error())
+    }
+
+    /// The next message that is not asynchronous: notices, notifications and parameter changes
+    /// are recorded and skipped.
+    fn next(inout self, dl: time.Deadline) -> Result[wire.Backend, postgres.Error] uses io, clock {
+        while true {
+            let m = self.read_msg(dl)?
+            match m {
+                wire.NoticeResp(e) => {
+                    if self.notices.len() >= 64 { self.notices.remove(0) }
+                    self.notices.push(e)
+                }
+                wire.ParamStatus(n, v) => { self.params.insert(n, v) }
+                wire.Notify(pid, ch, pl) => {
+                    if self.notifications.len() >= 1024 { self.notifications.remove(0) }
+                    self.notifications.push(postgres.Notification(pid, ch, pl))
+                }
+                _ => { return Ok(m) }
+            }
+        }
+        Err(closed_error())
+    }
+
+    // ------------------------------------------------------------------ startup
+
+    fn negotiate_tls(inout self, dl: time.Deadline) -> Result[bool, postgres.Error] uses net, io, clock, fs {
+        self.send(wire.ssl_request(), dl)?
+        let a = match secure.read(inout self.link, 1, dl) {
+            Ok(b) => b
+            Err(e) => { return Err(e) }
+        }
+        if a.len() != 1 { return Err(postgres.fail(postgres.Closed, "the server closed the connection at the SSLRequest")) }
+        // the answer is one byte; anything after it would be read as part of the TLS handshake
+        // or of the startup (CVE-2021-23222): refuse it
+        match net.try_recv(self.link.fd.raw(), 1) {
+            Ok(Some(extra)) => {
+                if extra.len() > 0 { return Err(postgres.fail(postgres.Protocol, "the server sent more than one byte after the SSLRequest answer")) }
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+        if a[0] == 83 {
+            let cfg = self.cfg.copy()
+            secure.upgrade(inout self.link, cfg, dl)?
+            return Ok(true)
+        }
+        if a[0] == 78 { return Ok(false) }
+        if a[0] == 69 { return Err(postgres.fail(postgres.Tls, "the server does not understand SSLRequest")) }
+        Err(postgres.fail(postgres.Protocol, "unexpected answer to the SSLRequest"))
+    }
+
+    fn handshake(inout self, password: Option[String], dl: time.Deadline) -> Result[(), postgres.Error] uses io, clock {
+        let cfg = self.cfg.copy()
+        self.send(wire.startup(cfg.user, cfg.database, cfg.application_name, cfg.params), dl)?
+        let mut sasl: Option[scram.Client] = None
+        let mut expected: List[u8] = List.new()
+        let mut verified = false
+        while true {
+            let m = self.next(dl)?
+            match m {
+                wire.AuthOk => {
+                    if sasl.is_some() && !verified {
+                        return Err(postgres.fail(postgres.Auth, "the server accepted the login without finishing the SCRAM exchange"))
+                    }
+                }
+                wire.AuthCleartext => {
+                    match password {
+                        Some(p) => { self.send(wire.password(p.bytes()), dl)? }
+                        None => { return Err(postgres.fail(postgres.Auth, "the server asks for a password and none was given")) }
+                    }
+                }
+                wire.AuthMd5(salt) => {
+                    match password {
+                        Some(p) => { self.send(wire.password(md5.password_message(cfg.user, p, salt)), dl)? }
+                        None => { return Err(postgres.fail(postgres.Auth, "the server asks for a password and none was given")) }
+                    }
+                }
+                wire.AuthSasl(mechs) => {
+                    if !mechs.contains(String.from(scram.MECHANISM)) {
+                        return Err(postgres.fail(postgres.Unsupported, "the server offers no SASL mechanism this client has (SCRAM-SHA-256)"))
+                    }
+                    if password.is_none() { return Err(postgres.fail(postgres.Auth, "the server asks for a password and none was given")) }
+                    let nonce = scram.random_nonce()?
+                    let (cl, first) = scram.first(nonce)
+                    sasl = Some(cl)
+                    self.send(wire.sasl_initial(scram.MECHANISM, first), dl)?
+                }
+                wire.AuthSaslContinue(data) => {
+                    let cl = match sasl {
+                        Some(c) => c
+                        None => { return Err(postgres.fail(postgres.Protocol, "SASLContinue without a SASL start")) }
+                    }
+                    let pw = match password {
+                        Some(p) => p
+                        None => { return Err(postgres.fail(postgres.Auth, "no password")) }
+                    }
+                    let fin = scram.respond(cl, pw, data)?
+                    expected = fin.server_signature
+                    self.send(wire.sasl_response(fin.message), dl)?
+                }
+                wire.AuthSaslFinal(data) => {
+                    if sasl.is_none() { return Err(postgres.fail(postgres.Protocol, "SASLFinal without a SASL start")) }
+                    scram.verify(data, expected)?
+                    verified = true
+                }
+                wire.AuthKerberos => { return Err(postgres.fail(postgres.Unsupported, "Kerberos authentication is not supported")) }
+                wire.AuthGss => { return Err(postgres.fail(postgres.Unsupported, "GSSAPI authentication is not supported")) }
+                wire.AuthSspi => { return Err(postgres.fail(postgres.Unsupported, "SSPI authentication is not supported")) }
+                wire.AuthOther(code) => {
+                    return Err(postgres.fail(postgres.Unsupported, "an authentication method this client does not know"))
+                }
+                wire.BackendKey(pid, secret) => {
+                    self.pid = pid
+                    self.secret = secret
+                }
+                wire.Ready(st) => {
+                    self.status = st
+                    return Ok(())
+                }
+                wire.ErrorResp(e) => {
+                    var err = e.copy()
+                    if e.class() == String.from("28") { err.kind = postgres.Auth }
+                    self.state = BROKEN
+                    return Err(err)
+                }
+                wire.Negotiate(v, opts) => {}
+                _ => {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Protocol, "an unexpected message during startup"))
+                }
+            }
+        }
+        Err(closed_error())
+    }
+
+    // ------------------------------------------------------------------ exchanges
+
+    /// Reads messages up to ReadyForQuery and gathers the results. `cols` are the columns of an
+    /// extended query's portal (a RowDescription replaces them). A server error is returned after
+    /// the exchange is complete, so the connection stays in step.
+    fn collect(inout self, cols: List[postgres.Column], extended: bool, dl: time.Deadline) -> Result[List[postgres.Rows], postgres.Error] uses io, clock {
+        let mut results: List[postgres.Rows] = List.new()
+        let mut cur_cols = cols.copy()
+        let mut cur_rows: List[postgres.Row] = List.new()
+        let mut held: usize = 0
+        let mut too_big = false
+        let mut first_err: Option[postgres.Error] = None
+        let mut sent_fail = false
+        while true {
+            let m = self.next(dl)?
+            match m {
+                wire.RowDesc(fs) => { cur_cols = fs }
+                wire.DataRow(cells) => {
+                    if cells.len() != cur_cols.len() {
+                        self.state = BROKEN
+                        return Err(postgres.fail(postgres.Protocol, "a DataRow with another number of cells than the result has columns"))
+                    }
+                    if !too_big {
+                        for c in cells {
+                            match c {
+                                Some(b) => { held += b.len() + 4 }
+                                None => { held += 4 }
+                            }
+                        }
+                        if held > self.cfg.max_result_bytes {
+                            too_big = true
+                            cur_rows.clear()
+                        } else {
+                            cur_rows.push(postgres.Row(cells))
+                        }
+                    }
+                }
+                wire.CmdComplete(tag) => {
+                    results.push(postgres.Rows(cur_cols, cur_rows, tag, affected(tag)))
+                    cur_cols = List.new()
+                    cur_rows = List.new()
+                }
+                wire.EmptyQuery => {
+                    results.push(postgres.Rows(List.new(), List.new(), String.from(""), 0))
+                }
+                wire.ErrorResp(e) => {
+                    if first_err.is_none() { first_err = Some(e) }
+                    cur_rows.clear()
+                }
+                wire.Ready(st) => {
+                    self.status = st
+                    break
+                }
+                wire.CopyIn(b, fs) => {
+                    // COPY needs copy_in; refuse it so the exchange can end
+                    if !sent_fail {
+                        sent_fail = true
+                        let mut cf = wire.copy_fail(String.from("COPY FROM STDIN needs Conn.copy_in"))
+                        // the extended protocol's Sync was ignored while the server waited for copy data
+                        if extended { cf.extend(wire.sync()) }
+                        self.send(cf, dl)?
+                    }
+                }
+                wire.CopyOut(b, fs) => {}
+                wire.CopyData(d) => {}
+                wire.CopyDone => {}
+                wire.ParseDone => {}
+                wire.BindDone => {}
+                wire.CloseDone => {}
+                wire.NoData => {}
+                wire.ParamDesc(o) => {}
+                wire.Suspended => {}
+                wire.Negotiate(v, o) => {}
+                _ => {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Protocol, "an unexpected message in a query result"))
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e)
+            None => {
+                if too_big { return Err(postgres.fail(postgres.Usage, "the result is larger than Config.max_result_bytes")) }
+                Ok(results)
+            }
+        }
+    }
+
+    fn check_ready(self) -> Result[(), postgres.Error] {
+        if self.state != READY { return Err(closed_error()) }
+        Ok(())
+    }
+
+    /// After a call: a timeout leaves a query running on the server; cancel it and wait for the
+    /// server to finish the exchange, or give the connection up.
+    fn after[T](inout self, r: Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock {
+        match r {
+            Err(e) => {
+                if e.kind == postgres.Timeout && self.state == READY { self.recover() }
+                Err(e)
+            }
+            Ok(v) => Ok(v)
+        }
+    }
+
+    fn recover(inout self) uses net, io, clock {
+        let grace = time.after_ms(self.cfg.cancel_grace_ms)
+        let z = cancel(self.cancel_key(), grace)
+        let mut going = true
+        while going {
+            match self.next(grace) {
+                Ok(m) => {
+                    match m {
+                        wire.Ready(st) => {
+                            self.status = st
+                            going = false
+                        }
+                        wire.CopyIn(b, fs) => {
+                            let s = self.send(wire.copy_fail(String.from("cancelled")), grace)
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    self.state = BROKEN
+                    going = false
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ statements
+
+    fn forget(inout self, key: String) {
+        match self.cache.get(key) {
+            Some(p) => {
+                self.cache.remove(key)
+                let mut keep: List[String] = List.new()
+                for k in self.order {
+                    if k != key { keep.push(k) }
+                }
+                self.order = keep
+            }
+            None => {}
+        }
+    }
+
+    /// The statement for `sql` with these parameter types: from the cache, or parsed and described.
+    fn prepared(inout self, sql: String, oids: List[u32], dl: time.Deadline) -> Result[(String, Prepared), postgres.Error] uses io, clock {
+        let mut key = String.from("")
+        for o in oids {
+            key.append(String.from_int(o as i64))
+            key.push_str(",")
+        }
+        key.push_str("|")
+        key.append(sql.copy())
+        match self.cache.get(key.copy()) {
+            Some(p) => { return Ok((key, p)) }
+            None => {}
+        }
+        let caching = self.cfg.cache_size > 0
+        let mut name = String.from("")
+        if caching {
+            name = String.from("s")
+            name.append(String.from_int(self.next_stmt as i64))
+            self.next_stmt += 1
+        }
+        let mut out = wire.parse(name.copy(), sql, oids)
+        out.extend(wire.describe(83, name.copy()))
+        out.extend(wire.sync())
+        self.send(out, dl)?
+        let mut param_oids: List[u32] = List.new()
+        let mut cols: List[postgres.Column] = List.new()
+        let mut first_err: Option[postgres.Error] = None
+        while true {
+            let m = self.next(dl)?
+            match m {
+                wire.ParseDone => {}
+                wire.ParamDesc(o) => { param_oids = o }
+                wire.RowDesc(fs) => { cols = fs }
+                wire.NoData => {}
+                wire.ErrorResp(e) => { if first_err.is_none() { first_err = Some(e) } }
+                wire.Ready(st) => {
+                    self.status = st
+                    break
+                }
+                _ => {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Protocol, "an unexpected message while preparing a statement"))
+                }
+            }
+        }
+        match first_err {
+            Some(e) => { return Err(e) }
+            None => {}
+        }
+        let mut fcols: List[postgres.Column] = List.new()
+        for c in cols {
+            var d = c.copy()
+            d.format = if codec.result_binary(c.type_oid) { 1 } else { 0 }
+            fcols.push(d)
+        }
+        let p = Prepared(name, param_oids, fcols)
+        if caching {
+            if self.cache.len() >= self.cfg.cache_size && self.order.len() > 0 {
+                let old = self.order.remove(0)
+                match self.cache.get(old.copy()) {
+                    Some(op) => { self.to_close.push(op.name) }
+                    None => {}
+                }
+                self.cache.remove(old)
+            }
+            self.cache.insert(key.copy(), p.copy())
+            self.order.push(key.copy())
+        }
+        Ok((key, p))
+    }
+
+    fn run(inout self, sql: String, params: List[postgres.Value], dl: time.Deadline) -> Result[postgres.Rows, postgres.Error] uses io, clock {
+        if params.len() > 65535 { return Err(postgres.fail(postgres.Param, "at most 65535 parameters")) }
+        let mut ps: List[wire.Param] = List.new()
+        let mut oids: List[u32] = List.new()
+        for v in params {
+            let p = codec.param(v)?
+            oids.push(p.oid)
+            ps.push(p)
+        }
+        let (key, st) = self.prepared(sql, oids, dl)?
+        if st.param_oids.len() != ps.len() {
+            let mut m = String.from("the statement takes ")
+            m.append(String.from_int(st.param_oids.len() as i64))
+            m.push_str(" parameters, ")
+            m.append(String.from_int(ps.len() as i64))
+            m.push_str(" given")
+            return Err(postgres.error(postgres.Param, m))
+        }
+        let mut fmts: List[u16] = List.new()
+        for c in st.columns { fmts.push(c.format) }
+        let mut out: List[u8] = List.new()
+        for n in self.to_close { out.extend(wire.close(83, n)) }
+        out.extend(wire.bind(String.from(""), st.name, ps, fmts))
+        out.extend(wire.execute(String.from(""), 0))
+        out.extend(wire.sync())
+        self.send(out, dl)?
+        self.to_close.clear()
+        let rs = match self.collect(st.columns, true, dl) {
+            Ok(r) => r
+            Err(e) => {
+                if stale(e) { self.forget(key) }
+                return Err(e)
+            }
+        }
+        if rs.len() == 0 { return Ok(postgres.Rows(List.new(), List.new(), String.from(""), 0)) }
+        Ok(rs[0])
+    }
+
+    /// Runs one statement with parameters: `$1`, `$2`, ... take the values in order. Integers,
+    /// booleans, floats and bytes travel in binary with their type; the other values as text,
+    /// which the server reads as whatever type the statement wants there. Returns the rows (none
+    /// for a command) and the command tag.
+    fn query[A: strings.Text](inout self, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[postgres.Rows, postgres.Error] uses net, io, clock {
+        self.check_ready()?
+        let text = sql.text()
+        let was_idle = self.status == 73
+        let mut r = self.run(text.copy(), params, dl)
+        match r {
+            Err(e) => {
+                // a statement the server lost (DEALLOCATE ALL, a pooler) or whose result changed:
+                // parse it again, once, when no transaction depends on the failed attempt
+                if stale(e) && was_idle && self.state == READY { r = self.run(text.copy(), params, dl) }
+            }
+            Ok(_) => {}
+        }
+        self.after(r)
+    }
+
+    /// `query` for a command: the number of rows it affected.
+    fn exec[A: strings.Text](inout self, sql: A, params: List[postgres.Value], dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock {
+        let rows = self.query(sql, params, dl)?
+        Ok(rows.affected)
+    }
+
+    /// Parses and describes `sql` now (and caches it): the parameter types the server settled on
+    /// and the result columns. Useful to check a statement and to fill the cache before a burst of
+    /// queries.
+    fn prepare[A: strings.Text](inout self, sql: A, dl: time.Deadline) -> Result[Prepared, postgres.Error] uses net, io, clock {
+        self.check_ready()?
+        let r = self.prepared(sql.text(), List.new(), dl)
+        match r {
+            Ok(kp) => {
+                let (k, p) = kp
+                self.after(Ok(p))
+            }
+            Err(e) => self.after(Err(e))
+        }
+    }
+
+    /// The simple query protocol: `sql` may hold several statements separated by `;` and takes no
+    /// parameters. One `Rows` per statement, results in the text form.
+    fn simple[A: strings.Text](inout self, sql: A, dl: time.Deadline) -> Result[List[postgres.Rows], postgres.Error] uses net, io, clock {
+        self.check_ready()?
+        let r = self.run_simple(sql.text(), dl)
+        self.after(r)
+    }
+
+    fn run_simple(inout self, sql: String, dl: time.Deadline) -> Result[List[postgres.Rows], postgres.Error] uses io, clock {
+        self.send(wire.query(sql), dl)?
+        self.collect(List.new(), false, dl)
+    }
+
+    /// Runs a command or a query through the simple protocol; the affected row count of the last
+    /// statement.
+    fn execute[A: strings.Text](inout self, sql: A, dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock {
+        let rs = self.simple(sql, dl)?
+        if rs.len() == 0 { return Ok(0) }
+        Ok(rs[rs.len() - 1].affected)
+    }
+
+    /// A round trip that checks the connection is alive (an empty query).
+    fn ping(inout self, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let r = self.run_simple(String.from(""), dl)
+        match r {
+            Ok(_) => Ok(())
+            Err(e) => self.after(Err(e))
+        }
+    }
+
+    // ------------------------------------------------------------------ transactions
+
+    fn begin(inout self, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let n = self.execute("BEGIN", dl)?
+        Ok(())
+    }
+
+    fn commit(inout self, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let n = self.execute("COMMIT", dl)?
+        Ok(())
+    }
+
+    fn rollback(inout self, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let n = self.execute("ROLLBACK", dl)?
+        Ok(())
+    }
+
+    fn savepoint(inout self, name: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        if !is_ident(name.copy()) { return Err(postgres.fail(postgres.Usage, "a savepoint name is letters, digits and underscores")) }
+        let mut sql = String.from("SAVEPOINT ")
+        sql.append(quote_ident(name))
+        let n = self.execute(sql, dl)?
+        Ok(())
+    }
+
+    fn release(inout self, name: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        if !is_ident(name.copy()) { return Err(postgres.fail(postgres.Usage, "a savepoint name is letters, digits and underscores")) }
+        let mut sql = String.from("RELEASE SAVEPOINT ")
+        sql.append(quote_ident(name))
+        let n = self.execute(sql, dl)?
+        Ok(())
+    }
+
+    fn rollback_to(inout self, name: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        if !is_ident(name.copy()) { return Err(postgres.fail(postgres.Usage, "a savepoint name is letters, digits and underscores")) }
+        let mut sql = String.from("ROLLBACK TO SAVEPOINT ")
+        sql.append(quote_ident(name))
+        let n = self.execute(sql, dl)?
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ COPY
+
+    /// COPY ... FROM STDIN: `sql` is the COPY statement, `chunks` the data in the format the
+    /// statement says (text lines, CSV, binary). Returns the number of rows copied.
+    fn copy_in[A: strings.Text](inout self, sql: A, chunks: List[List[u8]], dl: time.Deadline) -> Result[u64, postgres.Error] uses net, io, clock {
+        self.check_ready()?
+        let r = self.run_copy_in(sql.text(), chunks, dl)
+        self.after(r)
+    }
+
+    fn run_copy_in(inout self, sql: String, chunks: List[List[u8]], dl: time.Deadline) -> Result[u64, postgres.Error] uses io, clock {
+        self.send(wire.query(sql), dl)?
+        // wait for CopyInResponse (or the error that replaces it)
+        let mut started = false
+        let mut first_err: Option[postgres.Error] = None
+        while !started {
+            let m = self.next(dl)?
+            match m {
+                wire.CopyIn(b, fs) => { started = true }
+                wire.ErrorResp(e) => {
+                    first_err = Some(e)
+                    break
+                }
+                wire.Ready(st) => {
+                    self.status = st
+                    return Err(postgres.fail(postgres.Usage, "the statement is not a COPY FROM STDIN"))
+                }
+                wire.CopyOut(b, fs) => { }
+                wire.CmdComplete(t) => {}
+                wire.RowDesc(f) => {}
+                wire.DataRow(c) => {}
+                wire.CopyData(d) => {}
+                wire.CopyDone => {}
+                _ => {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Protocol, "an unexpected message at the start of COPY"))
+                }
+            }
+        }
+        if started {
+            for ch in chunks {
+                let mut at: usize = 0
+                while at < ch.len() {
+                    let stop = if at + 65536 < ch.len() { at + 65536 } else { ch.len() }
+                    self.send(wire.copy_data(ch.slice(at, stop)), dl)?
+                    at = stop
+                }
+            }
+            self.send(wire.copy_done(), dl)?
+        }
+        let mut rows: u64 = 0
+        while true {
+            let m = self.next(dl)?
+            match m {
+                wire.CmdComplete(t) => { rows = affected(t) }
+                wire.ErrorResp(e) => { if first_err.is_none() { first_err = Some(e) } }
+                wire.Ready(st) => {
+                    self.status = st
+                    break
+                }
+                _ => {}
+            }
+        }
+        match first_err {
+            Some(e) => Err(e)
+            None => Ok(rows)
+        }
+    }
+
+    /// COPY ... TO STDOUT: all the data the server sends, up to `max_bytes` (more is a `Usage`
+    /// error; the rest is read and dropped so the connection stays in step).
+    fn copy_out[A: strings.Text](inout self, sql: A, max_bytes: usize, dl: time.Deadline) -> Result[List[u8], postgres.Error] uses net, io, clock {
+        self.check_ready()?
+        let r = self.run_copy_out(sql.text(), max_bytes, dl)
+        self.after(r)
+    }
+
+    fn run_copy_out(inout self, sql: String, max_bytes: usize, dl: time.Deadline) -> Result[List[u8], postgres.Error] uses io, clock {
+        self.send(wire.query(sql), dl)?
+        let mut data: List[u8] = List.new()
+        let mut first_err: Option[postgres.Error] = None
+        let mut too_big = false
+        let mut saw_out = false
+        while true {
+            let m = self.next(dl)?
+            match m {
+                wire.CopyOut(b, fs) => { saw_out = true }
+                wire.CopyData(d) => {
+                    if !too_big {
+                        if data.len() + d.len() > max_bytes {
+                            too_big = true
+                            data.clear()
+                        } else {
+                            data.extend(d)
+                        }
+                    }
+                }
+                wire.ErrorResp(e) => { if first_err.is_none() { first_err = Some(e) } }
+                wire.Ready(st) => {
+                    self.status = st
+                    break
+                }
+                wire.CopyIn(b, fs) => {
+                    let s = self.send(wire.copy_fail(String.from("not a COPY TO STDOUT")), dl)
+                }
+                _ => {}
+            }
+        }
+        match first_err {
+            Some(e) => { return Err(e) }
+            None => {}
+        }
+        if too_big { return Err(postgres.fail(postgres.Usage, "the COPY output is larger than max_bytes")) }
+        if !saw_out { return Err(postgres.fail(postgres.Usage, "the statement is not a COPY TO STDOUT")) }
+        Ok(data)
+    }
+
+    // ------------------------------------------------------------------ LISTEN / NOTIFY
+
+    /// LISTEN on a channel; notifications arrive with `wait_notification` and
+    /// `take_notifications`.
+    fn listen(inout self, channel: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let mut sql = String.from("LISTEN ")
+        sql.append(quote_ident(channel))
+        let n = self.execute(sql, dl)?
+        Ok(())
+    }
+
+    fn unlisten(inout self, channel: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let mut sql = String.from("UNLISTEN ")
+        sql.append(quote_ident(channel))
+        let n = self.execute(sql, dl)?
+        Ok(())
+    }
+
+    /// NOTIFY through `pg_notify` (so the payload is a parameter, not SQL text).
+    fn notify(inout self, channel: String, payload: String, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock {
+        let ps = List[postgres.Text(channel), postgres.Text(payload)]
+        let r = self.query("SELECT pg_notify($1, $2)", ps, dl)?
+        Ok(())
+    }
+
+    /// The next notification, waiting until `dl`: None when the deadline passes first (the
+    /// connection stays usable). Notifications received during other calls are returned first.
+    fn wait_notification(inout self, dl: time.Deadline) -> Result[Option[postgres.Notification], postgres.Error] uses io, clock {
+        self.check_ready()?
+        if self.notifications.len() > 0 { return Ok(Some(self.notifications.remove(0))) }
+        while true {
+            let m = match self.read_msg(dl) {
+                Ok(m) => m
+                Err(e) => {
+                    if e.kind == postgres.Timeout { return Ok(None) }
+                    return Err(e)
+                }
+            }
+            match m {
+                wire.Notify(pid, ch, pl) => { return Ok(Some(postgres.Notification(pid, ch, pl))) }
+                wire.NoticeResp(e) => { self.notices.push(e) }
+                wire.ParamStatus(n, v) => { self.params.insert(n, v) }
+                wire.ErrorResp(e) => { return Err(e) }
+                _ => {
+                    self.state = BROKEN
+                    return Err(postgres.fail(postgres.Protocol, "an unexpected message while waiting for a notification"))
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // ------------------------------------------------------------------ closing
+
+    /// Says goodbye (Terminate) and closes the socket. The connection is unusable afterwards.
+    fn close(inout self) uses io, clock {
+        if self.state == READY {
+            let z = secure.write(inout self.link, wire.terminate(), time.after_ms(200))
+        }
+        self.state = BROKEN
+        secure.close(inout self.link)
+    }
+}
+
+// ------------------------------------------------------------------------------- connecting
+
+fn open(cfg: postgres.Config, dl: time.Deadline) -> Result[Conn, postgres.Error] uses net, io, clock, fs {
+    let addrs = secure.resolve(cfg.host.copy(), cfg.port, dl)?
+    let (link, addr) = secure.dial(addrs, dl)?
+    let mut c = new_conn(link, addr, cfg)
+    let want_tls = cfg.sslmode != postgres.Disable && addr.family != net.UNIX
+    if want_tls {
+        match c.negotiate_tls(dl) {
+            Ok(true) => {}
+            Ok(false) => {
+                if cfg.sslmode != postgres.Prefer {
+                    c.close()
+                    return Err(postgres.fail(postgres.Tls, "the server does not support TLS"))
+                }
+            }
+            Err(e) => {
+                c.close()
+                if cfg.sslmode == postgres.Prefer && e.kind != postgres.Timeout {
+                    // libpq goes on without TLS when it was only preferred
+                    let (link2, addr2) = secure.dial(addrs, dl)?
+                    return Ok(new_conn(link2, addr2, cfg))
+                }
+                return Err(e)
+            }
+        }
+    }
+    Ok(c)
+}
+
+/// Connects: resolves `cfg.host`, opens the socket, negotiates TLS per `cfg.sslmode`,
+/// authenticates and reads the server's startup parameters. `dl` and `cfg.connect_timeout_ms` (the
+/// earlier of the two) bound all of it.
+pub fn connect(cfg: postgres.Config, dl: time.Deadline) -> Result[Conn, postgres.Error] uses net, io, clock, fs {
+    let by = time.after_ms(cfg.connect_timeout_ms).earlier(dl)
+    let mut c = open(cfg, by)?
+    match c.handshake(cfg.password, by) {
+        Ok(_) => Ok(c)
+        Err(e) => {
+            c.close()
+            Err(e)
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------- transactions
+
+fn trap_error(m: String) -> postgres.Error {
+    var e = postgres.fail(postgres.Closed, "the function trapped; the connection was closed and the server rolls the transaction back")
+    e.detail = m
+    e
+}
+
+/// Runs `f` in a transaction: BEGIN, `f`, and COMMIT when it returns `Ok`; ROLLBACK when it
+/// returns `Err` (the `Err` is returned) and when it traps (the connection is closed, which makes
+/// the server roll back; the result is a `Closed` error whose `detail` is the trap's message). Inside
+/// a transaction already open, a SAVEPOINT stands for BEGIN, so calls nest. `f` gets the
+/// connection and runs statements on it as usual.
+pub fn transaction[T](inout c: Conn, dl: time.Deadline, f: fn(inout Conn) -> Result[T, postgres.Error]) -> Result[T, postgres.Error] uses net, io, clock {
+    c.check_ready()?
+    let nested = c.in_transaction()
+    let mut sp = String.from("")
+    if nested {
+        c.sp_depth += 1
+        sp = String.from("eider_sp_")
+        sp.append(String.from_int(c.sp_depth as i64))
+        c.savepoint(sp.copy(), dl)?
+    } else {
+        c.begin(dl)?
+    }
+    let caught = task.catch(|| -> (Conn, Result[T, postgres.Error]) {
+        let mut cc = c.copy()
+        let r = f(inout cc)
+        (cc, r)
+    })
+    match caught {
+        Err(m) => {
+            // the work on `c` is unknown: drop the connection, the server aborts the transaction
+            c.close()
+            Err(trap_error(m))
+        }
+        Ok(pair) => {
+            let (cc, r) = pair
+            c = cc
+            match r {
+                Ok(v) => {
+                    let end = if nested { c.release(sp.copy(), dl) } else { c.commit(dl) }
+                    match end {
+                        Ok(_) => {
+                            if nested { c.sp_depth -= 1 }
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            // a failed COMMIT has rolled back; make sure
+                            if c.usable() && c.in_transaction() {
+                                let z = if nested { c.rollback_to(sp.copy(), dl) } else { c.rollback(dl) }
+                            }
+                            if nested { c.sp_depth -= 1 }
+                            Err(e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    if c.usable() && c.in_transaction() {
+                        if nested {
+                            let z = c.rollback_to(sp.copy(), dl)
+                            let y = c.release(sp.copy(), dl)
+                        } else {
+                            let z = c.rollback(dl)
+                        }
+                    }
+                    if nested { c.sp_depth -= 1 }
+                    Err(e)
+                }
+            }
+        }
+    }
+}

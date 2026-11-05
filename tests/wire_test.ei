@@ -1,0 +1,230 @@
+// The wire codec without a server: encoders against bytes written out by hand, decoders against
+// hand-built backend messages, frame cutting, and a fuzz run (random and mutated messages must give
+// Ok or Err, never a trap).
+
+import std.encoding
+import postgres
+import postgres.wire
+import postgres.tests.util
+
+fn hex(b: List[u8]) -> String { encoding.hex(b) }
+
+fn show(r: Result[wire.Backend, postgres.Error]) uses io {
+    match r {
+        Ok(m) => print("  {m}")
+        Err(e) => print("  error {e.kind}: {e.message}")
+    }
+}
+
+fn main() uses io {
+    // ---- encoders
+    print(hex(wire.query(String.from("SELECT 1"))))
+    print(hex(wire.sync()))
+    print(hex(wire.flush()))
+    print(hex(wire.terminate()))
+    print(hex(wire.copy_done()))
+    print(hex(wire.ssl_request()))
+    print(hex(wire.cancel_request(1234, util.i32be(5678))))
+    print(hex(wire.password("secret".bytes())))
+    print(hex(wire.sasl_initial("SCRAM-SHA-256", "n,,n=,r=abc".bytes())))
+    print(hex(wire.sasl_response("c=biws,r=abc".bytes())))
+    print(hex(wire.copy_data("a\tb\n".bytes())))
+    print(hex(wire.copy_fail(String.from("no"))))
+    print(hex(wire.startup(String.from("bob"), String.from("db"), String.from("app"), List.new())))
+    print(hex(wire.startup(String.from("bob"), String.from(""), String.from(""), List[(String.from("search_path"), String.from("x"))])))
+    print(hex(wire.parse(String.from("s1"), String.from("SELECT $1"), List[0 as u32, 23])))
+    print(hex(wire.describe(83, String.from("s1"))))
+    print(hex(wire.execute(String.from(""), 0)))
+    print(hex(wire.close(83, String.from("s1"))))
+    let ps = List[wire.Param(0, false, Some("42".bytes())), wire.Param(17, true, Some("ab".bytes())), wire.Param(0, false, None)]
+    print(hex(wire.bind(String.from(""), String.from("s1"), ps, List[1 as u16, 0])))
+
+    // ---- decoders
+    print("authentication")
+    show(wire.decode(82, util.i32be(0)))
+    show(wire.decode(82, util.i32be(3)))
+    show(wire.decode(82, util.i32be(2)))
+    let mut md5 = util.i32be(5)
+    md5.extend("salt".bytes())
+    show(wire.decode(82, md5))
+    let mut sasl = util.i32be(10)
+    sasl.extend(util.cstr("SCRAM-SHA-256"))
+    sasl.extend(util.cstr("SCRAM-SHA-256-PLUS"))
+    sasl.push(0)
+    show(wire.decode(82, sasl))
+    let mut cont = util.i32be(11)
+    cont.extend("r=a,s=b,i=1".bytes())
+    show(wire.decode(82, cont))
+    show(wire.decode(82, util.i32be(12)))
+    show(wire.decode(82, util.i32be(99)))
+    show(wire.decode(82, List.new()))
+    print("startup")
+    show(wire.decode(75, util.i32be(7)))
+    let mut key = util.i32be(7)
+    key.extend(util.i32be(9))
+    show(wire.decode(75, key))
+    let mut long_key = util.i32be(7)
+    long_key.extend(List.filled(1 as u8, 32))
+    show(wire.decode(75, long_key))
+    let mut huge_key = util.i32be(7)
+    huge_key.extend(List.filled(1 as u8, 300))
+    show(wire.decode(75, huge_key))
+    let mut ps2 = util.cstr("server_version")
+    ps2.extend(util.cstr("17.2"))
+    show(wire.decode(83, ps2))
+    show(wire.decode(90, "I".bytes()))
+    show(wire.decode(90, "T".bytes()))
+    show(wire.decode(90, "E".bytes()))
+    show(wire.decode(90, "Q".bytes()))
+    show(wire.decode(90, List.new()))
+    print("results")
+    let mut cols: List[(str, u32)] = List.new()
+    cols.push(("id", 23))
+    cols.push(("héllo", 25))
+    let rd = util.row_desc(cols)
+    show(wire.decode(84, rd.slice(5, rd.len())))
+    let dr = util.data_row(List[Some("1"), None, Some("")])
+    show(wire.decode(68, dr.slice(5, dr.len())))
+    show(wire.decode(67, util.cstr("INSERT 0 5")))
+    show(wire.decode(67, "INSERT".bytes()))
+    show(wire.decode(73, List.new()))
+    show(wire.decode(73, "x".bytes()))
+    show(wire.decode(49, List.new()))
+    show(wire.decode(50, List.new()))
+    show(wire.decode(51, List.new()))
+    show(wire.decode(110, List.new()))
+    show(wire.decode(115, List.new()))
+    let mut pd = util.i16be(2)
+    pd.extend(util.i32be(23))
+    pd.extend(util.i32be(25))
+    show(wire.decode(116, pd))
+    show(wire.decode(116, util.i16be(2)))
+    print("copy and notify")
+    let mut cin = "".bytes()
+    cin.push(0)
+    cin.extend(util.i16be(2))
+    cin.extend(util.i16be(0))
+    cin.extend(util.i16be(0))
+    show(wire.decode(71, cin))
+    show(wire.decode(72, cin))
+    show(wire.decode(87, cin))
+    show(wire.decode(71, List[2 as u8, 0, 0]))
+    show(wire.decode(100, "row\n".bytes()))
+    show(wire.decode(99, List.new()))
+    let mut nt = util.i32be(321)
+    nt.extend(util.cstr("chan"))
+    nt.extend(util.cstr("payload"))
+    show(wire.decode(65, nt))
+    let mut nv = util.i32be(196610)
+    nv.extend(util.i32be(1))
+    nv.extend(util.cstr("_pq_.x"))
+    show(wire.decode(118, nv))
+    show(wire.decode(118, util.i32be(196610)))
+    show(wire.decode(33, List.new()))
+    print("errors")
+    let mut er: List[u8] = List.new()
+    for f in List[("S", "ERROR"), ("V", "ERROR"), ("C", "23505"), ("M", "duplicate key"), ("D", "Key (id)=(1) exists."), ("H", "try again"), ("P", "17"), ("p", "3"), ("q", "SELECT 1"), ("W", "SQL statement"), ("s", "public"), ("t", "users"), ("c", "id"), ("d", "int4"), ("n", "users_pkey"), ("F", "nbtinsert.c"), ("L", "666"), ("R", "_bt_check_unique"), ("Z", "ignored")] {
+        let (k, v) = f
+        er.extend(k.bytes())
+        er.extend(util.cstr(v))
+    }
+    er.push(0)
+    match wire.decode(69, er) {
+        Ok(wire.ErrorResp(e)) => {
+            print("  {e.severity} {e.sqlstate} {e.message} | {e.detail} | {e.hint} | {e.position} {e.internal_position} {e.internal_query}")
+            print("  {e.context} {e.schema} {e.table} {e.column} {e.datatype} {e.constraint} {e.file} {e.line} {e.routine}")
+            print("  {postgres.error_text(e)}")
+        }
+        _ => print("  not an error response")
+    }
+    let mut bad_pos = "P".bytes()
+    bad_pos.extend(util.cstr("12x"))
+    bad_pos.extend("M".bytes())
+    bad_pos.extend(util.cstr("m"))
+    bad_pos.push(0)
+    match wire.decode(78, bad_pos) {
+        Ok(wire.NoticeResp(e)) => print("  notice {e.message} position {e.position}")
+        _ => print("  not a notice")
+    }
+    show(wire.decode(69, List.new()))
+    show(wire.decode(69, "S".bytes()))
+    show(wire.decode(69, List[0 as u8]))
+
+    // ---- frames
+    print("frames")
+    let ready = util.ready()
+    match wire.frame(ready, 0, 1000) {
+        wire.Frame(tag, body, used) => print("  frame {tag} {body} {used}")
+        _ => print("  not a frame")
+    }
+    match wire.frame(ready.slice(0, 3), 0, 1000) {
+        wire.NeedMore(n) => print("  need {n} more")
+        _ => print("  ?")
+    }
+    match wire.frame(ready.slice(0, 5), 0, 1000) {
+        wire.NeedMore(n) => print("  need {n} more")
+        _ => print("  ?")
+    }
+    let mut two = ready.copy()
+    two.extend(util.command_complete("X"))
+    match wire.frame(two, ready.len(), 1000) {
+        wire.Frame(tag, body, used) => print("  second frame {tag} {used}")
+        _ => print("  ?")
+    }
+    match wire.frame(two, 0, 0) {
+        wire.Frame(tag, body, used) => print("  frame of length 1 within a limit of 0")
+        wire.BadFrame(e) => print("  over the limit: {e.message}")
+        _ => print("  ?")
+    }
+
+    // ---- fuzz: random bodies for every tag, and mutations of valid messages
+    let mut seed: u64 = 88172645463325252
+    let mut ok_n: i64 = 0
+    let mut err_n: i64 = 0
+    let tags = List[82 as u8, 75, 83, 90, 84, 68, 67, 69, 78, 73, 49, 50, 51, 110, 115, 116, 65, 71, 72, 87, 100, 99, 118, 33]
+    let mut round = 0
+    while round < 30000 {
+        seed = seed ^ (seed << 13)
+        seed = seed ^ (seed >> 7)
+        seed = seed ^ (seed << 17)
+        let tag = tags[(seed % (tags.len() as u64)) as usize]
+        let n = ((seed >> 8) % 40) as usize
+        let mut body: List[u8] = List.new()
+        let mut k: usize = 0
+        while k < n {
+            seed = seed ^ (seed << 13)
+            seed = seed ^ (seed >> 7)
+            seed = seed ^ (seed << 17)
+            // bias the bytes towards small values and zero, where the structure is
+            let v = (seed >> 11) % 6
+            body.push(if v < 3 { 0 } else if v < 5 { ((seed >> 20) % 4) as u8 } else { ((seed >> 20) % 256) as u8 })
+            k += 1
+        }
+        match wire.decode(tag, body) {
+            Ok(m) => { ok_n += 1 }
+            Err(e) => { err_n += 1 }
+        }
+        round += 1
+    }
+    let valid = List[rd.slice(5, rd.len()), dr.slice(5, dr.len()), er, nt, cin, pd, sasl, md5]
+    let vtags = List[84 as u8, 68, 69, 65, 71, 116, 82, 82]
+    for vi in 0..valid.len() {
+        let orig = valid[vi]
+        for pos in 0..orig.len() {
+            for delta in List[1 as u8, 127, 255] {
+                let mut m = orig.copy()
+                m[pos] = m[pos] +% delta
+                match wire.decode(vtags[vi], m) {
+                    Ok(x) => { ok_n += 1 }
+                    Err(e) => { err_n += 1 }
+                }
+            }
+            // every prefix
+            match wire.decode(vtags[vi], orig.slice(0, pos)) {
+                Ok(x) => { ok_n += 1 }
+                Err(e) => { err_n += 1 }
+            }
+        }
+    }
+    print("fuzz: {ok_n + err_n} decodes survived, some ok: {ok_n > 0}, some rejected: {err_n > 0}")
+}

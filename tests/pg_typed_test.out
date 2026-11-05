@@ -1,0 +1,25 @@
+insert ada: 1
+insert bob: 1
+1 Ada Some("ada@example.org") 9.5 true ["a", "b c"] 2026-11-05T08:30:00Z
+2 Bob None 3.25 false [] 2026-11-05T08:30:00Z
+query_one: Bob email None
+query_opt none: true
+query_opt some with unknown=ignore: 1
+by record: 1 row, id 2
+by list: 2 rows
+by scalar: 1 row
+int8 value in range: ok 1 rows
+ok: ok 2 rows
+missing column: Decode: row 0: missing field `label`
+unknown column: Decode: row 0: unknown field `extra`
+int8 into i32: Decode: row 0: id: expected an i32, the number is out of range
+text into i32: Decode: row 0: id: expected an integer, found text (column type 25)
+null into i32: Decode: row 0: id: expected an integer, found null (column type 23)
+int into String: Decode: row 0: label: expected text, found an integer (column type 23)
+Wrong: row 0: id: expected text, found an integer (column type 20)
+NoNull: row 1: email: expected text, found null (column type 25)
+Missing: row 0: missing field `nope`
+Tiny: row 0: n: expected a u8, the number is out of range
+count: 2
+query_one with two rows: Decode expected one row, got 2
+mixed: 1.5 2.5 a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 {"k": 1} 12.30 2026-01-02T00:00:00Z [0, 255] 9 [3, 4]

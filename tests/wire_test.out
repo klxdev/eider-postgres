@@ -1,0 +1,80 @@
+510000000d53454c454354203100
+5300000004
+4800000004
+5800000004
+6300000004
+0000000804d2162f
+0000001004d2162e000004d20000162e
+700000000b73656372657400
+7000000021534352414d2d5348412d323536000000000b6e2c2c6e3d2c723d616263
+7000000010633d626977732c723d616263
+64000000086109620a
+66000000076e6f00
+00000048000300007573657200626f62006461746162617365006462006170706c69636174696f6e5f6e616d650061707000636c69656e745f656e636f64696e6700555446380000
+00000035000300007573657200626f6200636c69656e745f656e636f64696e670055544638007365617263685f7061746800780000
+500000001b73310053454c4543542024310000020000000000000017
+440000000853733100
+45000000090000000000
+430000000853733100
+42000000280073310000030000000100000003000000023432000000026162ffffffff000200010000
+authentication
+  AuthOk
+  AuthCleartext
+  AuthKerberos
+  AuthMd5([115, 97, 108, 116])
+  AuthSasl(["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"])
+  AuthSaslContinue([114, 61, 97, 44, 115, 61, 98, 44, 105, 61, 49])
+  AuthSaslFinal([])
+  AuthOther(99)
+  error Protocol: malformed Authentication message from the server
+startup
+  error Protocol: malformed BackendKeyData message from the server
+  BackendKey(7, [0, 0, 0, 9])
+  BackendKey(7, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+  error Protocol: malformed BackendKeyData message from the server
+  ParamStatus("server_version", "17.2")
+  Ready(73)
+  Ready(84)
+  Ready(69)
+  error Protocol: malformed ReadyForQuery message from the server
+  error Protocol: malformed ReadyForQuery message from the server
+results
+  RowDesc([Column { name: "id", table_oid: 0, attnum: 0, type_oid: 23, type_size: -1, type_mod: -1, format: 0 }, Column { name: "héllo", table_oid: 0, attnum: 0, type_oid: 25, type_size: -1, type_mod: -1, format: 0 }])
+  DataRow([Some([49]), None, Some([])])
+  CmdComplete("INSERT 0 5")
+  error Protocol: malformed CommandComplete message from the server
+  EmptyQuery
+  error Protocol: malformed EmptyQueryResponse message from the server
+  ParseDone
+  BindDone
+  CloseDone
+  NoData
+  Suspended
+  ParamDesc([23, 25])
+  error Protocol: malformed ParameterDescription message from the server
+copy and notify
+  CopyIn(false, [0, 0])
+  CopyOut(false, [0, 0])
+  CopyBoth(false, [0, 0])
+  error Protocol: malformed CopyInResponse message from the server
+  CopyData([114, 111, 119, 10])
+  CopyDone
+  Notify(321, "chan", "payload")
+  Negotiate(196610, ["_pq_.x"])
+  error Protocol: malformed NegotiateProtocolVersion message from the server
+  error Protocol: unknown message type 33 from the server
+errors
+  ERROR 23505 duplicate key | Key (id)=(1) exists. | try again | 17 3 SELECT 1
+  SQL statement public users id int4 users_pkey nbtinsert.c 666 _bt_check_unique
+  ERROR 23505: duplicate key (detail: Key (id)=(1) exists.) (hint: try again) (position 17)
+  notice m position 0
+  error Protocol: malformed ErrorResponse message from the server
+  error Protocol: malformed ErrorResponse message from the server
+  ErrorResp(ERROR: (no message))
+frames
+  frame 90 [73] 6
+  need 2 more
+  need 1 more
+  second frame 67 7
+  over the limit: message from the server is longer than the limit
+fuzz: 31308 decodes survived, some ok: true, some rejected: true

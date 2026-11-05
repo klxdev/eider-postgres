@@ -1,0 +1,54 @@
+usable: true in tx: false encrypted: false
+version ok: true
+client_encoding UTF8
+columns: 6 rows: 1 tag: SELECT 1 affected: 1
+  Int(42) | Text("héllo") | Bool(true) | Float(2.5) | Null | Bytes([97, 98, 99])
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Int(2)
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Int(12)
+columns: 4 rows: 1 tag: SELECT 1 affected: 1
+  Numeric("12.5") | Uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11") | Date(DateTime { year: 2026, month: 11, day: 5, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 }) | TimestampTz(DateTime { year: 2026, month: 11, day: 5, hour: 13, minute: 45, second: 1, nanos: 0, offset_min: 0 })
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Array([Int(1), Null, Int(3)])
+insert: 1
+insert: 1
+columns: 4 rows: 2 tag: SELECT 2 affected: 2
+  Int(1) | Text("ada") | Float(9.5) | Date(DateTime { year: 1815, month: 12, day: 10, hour: 0, minute: 0, second: 0, nanos: 0, offset_min: 0 })
+  Int(2) | Text("bob") | Null | Null
+update: 1
+delete none: 0
+cache grew by 1, results 1 1
+prepared: params [23, 25] columns 2
+kind Server state 23505 class 23 severity ERROR
+message: duplicate key value violates unique constraint "q_test_pkey"
+detail: Key (id)=(1) already exists.
+constraint q_test_pkey table q_test schema public
+is unique violation: true is constraint: true
+usable after an error: true
+syntax: 42601 position 1: syntax error at or near "SELEC"
+ERROR 42P01: relation "no_such_table" does not exist (position 15)
+22012 division by zero
+wrong parameter count: Param the statement takes 1 parameters, 0 given
+bad text for an int: 22P02
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Text("still works")
+statements: 3
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Int(1)
+columns: 2 rows: 1 tag: SELECT 1 affected: 1
+  Text("two") | Int(3)
+columns: 0 rows: 0 tag: UPDATE 0 affected: 0
+empty query: 1
+second statement fails: 22012
+usable: true
+notice NOTICE: table "q_test" does not exist, skipping
+notice NOTICE: hello from the server
+big: 20000 last Text("row 20000")
+wide: true
+too big: Usage the result is larger than Config.max_result_bytes
+still usable: true
+columns: 1 rows: 1 tag: SELECT 1 affected: 1
+  Int(1)
+closed: false
+after close: Closed

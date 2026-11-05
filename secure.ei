@@ -1,0 +1,179 @@
+//! postgres.secure: the byte stream under a connection, plain or TLS, and the dial.
+//!
+//! A `Link` is a socket and, after the SSLRequest handshake (`upgrade`), a TLS 1.3 session from
+//! eider-tls over it. Every read and write takes a deadline and fails with a
+//! `postgres.Error` (`Timeout` or `Io`). This is the only module that imports eider-tls.
+
+import std.net
+import std.stream
+import std.strings
+import std.time
+import tls.alert
+import tls.client
+import tls.config
+import tls.conn
+import tls.x509
+import postgres
+
+pub type Link = { fd: stream.Fd, tls: Option[conn.Conn[stream.Fd]] }
+
+fn from_stream(e: stream.Error) -> postgres.Error {
+    let kind = if e.kind == stream.TimedOut { postgres.Timeout } else { postgres.Io }
+    postgres.error(kind, e.message)
+}
+
+/// Whether the stream is encrypted.
+pub fn encrypted(l: Link) -> bool { l.tls.is_some() }
+
+/// Reads between 1 and `max` bytes; an empty list means the peer closed the stream.
+pub fn read(inout l: Link, max: usize, dl: time.Deadline) -> Result[List[u8], postgres.Error] uses io, clock {
+    match l.tls {
+        Some(mut c) => {
+            match c.read_by(max, dl) {
+                Ok(b) => Ok(b)
+                Err(e) => Err(from_stream(e))
+            }
+        }
+        None => {
+            let mut f = l.fd
+            match f.read_by(max, dl) {
+                Ok(b) => Ok(b)
+                Err(e) => Err(from_stream(e))
+            }
+        }
+    }
+}
+
+/// Writes all of `data` before `dl`. After an error some of it may have been sent: the stream is
+/// no longer usable.
+pub fn write(inout l: Link, data: List[u8], dl: time.Deadline) -> Result[(), postgres.Error] uses io, clock {
+    match l.tls {
+        Some(mut c) => {
+            match stream.write_all_by(inout c, data, dl) {
+                Ok(_) => Ok(())
+                Err(e) => Err(from_stream(e))
+            }
+        }
+        None => {
+            let mut f = l.fd
+            match stream.write_all_by(inout f, data, dl) {
+                Ok(_) => Ok(())
+                Err(e) => Err(from_stream(e))
+            }
+        }
+    }
+}
+
+/// Closes the session (a TLS close_notify, best effort) and the socket.
+pub fn close(inout l: Link) uses io, clock {
+    match l.tls {
+        Some(mut c) => {
+            let z = c.close_by(time.after_ms(200))
+        }
+        None => {}
+    }
+    let z = l.fd.close()
+}
+
+/// The address of a host (a name, an IP address, or the directory of a Unix socket) and port, all
+/// the addresses the resolver gave, in its order.
+pub fn resolve(host: String, port: i32, dl: time.Deadline) -> Result[List[net.Addr], postgres.Error] uses net, io, clock {
+    let mut out: List[net.Addr] = List.new()
+    if host.len() > 0 && host.byte(0) == 47 {
+        let mut path = host.copy()
+        path.push_str("/.s.PGSQL.")
+        path.append(String.from_int(port as i64))
+        out.push(net.unix(path.bytes()))
+        return Ok(out)
+    }
+    match net.parse(host.bytes(), port) {
+        Ok(a) => {
+            out.push(a)
+            return Ok(out)
+        }
+        Err(_) => {}
+    }
+    match net.lookup_by(host.bytes(), String.from_int(port as i64).bytes(), 0, net.STREAM, dl) {
+        Ok(addrs) => {
+            if addrs.len() == 0 {
+                let mut m = String.from("no address for ")
+                m.append(host)
+                return Err(postgres.error(postgres.Io, m))
+            }
+            Ok(addrs)
+        }
+        Err(m) => {
+            let kind = if strings.contains(m, "deadline") { postgres.Timeout } else { postgres.Io }
+            Err(postgres.error(kind, m))
+        }
+    }
+}
+
+/// A TCP connection to the first of `addrs` that answers, each attempt given an equal share of
+/// the time left.
+pub fn dial(addrs: List[net.Addr], dl: time.Deadline) -> Result[(Link, net.Addr), postgres.Error] uses net, io, clock {
+    let mut last = postgres.fail(postgres.Io, "no address")
+    let mut i: usize = 0
+    for a in addrs {
+        let left = addrs.len() - i
+        i += 1
+        let attempt = if left == 1 { dl } else { time.after(time.nanos(dl.remaining().as_ns() / (left as i64))).earlier(dl) }
+        match stream.connect_by(a, attempt) {
+            Ok(f) => {
+                if a.family != net.UNIX {
+                    let z = net.set_option(f.raw(), net.NODELAY, 1)
+                }
+                return Ok((Link(f, None), a))
+            }
+            Err(e) => { last = from_stream(e) }
+        }
+    }
+    Err(last)
+}
+
+fn tls_error(e: alert.Error) -> postgres.Error {
+    let mut s = String.from("")
+    e.show(inout s)
+    let kind = if e.kind == alert.Io && e.io_kind == stream.TimedOut { postgres.Timeout } else { postgres.Tls }
+    postgres.error(kind, s)
+}
+
+/// Runs the TLS client handshake on the socket, after the server said `S` to the SSLRequest. For
+/// `Require` and `Prefer` the server's certificate is not verified (the handshake's signatures
+/// still are); `VerifyCa` and `VerifyFull` verify the chain against `cfg.root_cert` (PEM) or the
+/// system's store, and the certificate against the host name.
+pub fn upgrade(inout l: Link, cfg: postgres.Config, dl: time.Deadline) -> Result[(), postgres.Error] uses net, io, clock, fs {
+    let verify = match cfg.sslmode {
+        postgres.VerifyCa => true
+        postgres.VerifyFull => true
+        _ => false
+    }
+    let mut roots = x509.empty_store()
+    if verify {
+        match cfg.root_cert {
+            Some(pem) => {
+                roots = match x509.store_from_pem(pem) {
+                    Ok(s) => s
+                    Err(m) => { return Err(postgres.error(postgres.BadConfig, m)) }
+                }
+            }
+            None => {
+                roots = match x509.system_store() {
+                    Ok(s) => s
+                    Err(m) => { return Err(postgres.error(postgres.BadConfig, m)) }
+                }
+            }
+        }
+    }
+    var tc = config.client_config("localhost", roots)
+    tc.server_name = Some(cfg.host.bytes())
+    if !verify { tc.verify = config.Insecure }
+    tc.now = cfg.tls_now
+    match client.connect(l.fd, tc, dl) {
+        Ok(c) => {
+            l.tls = Some(c)
+            Ok(())
+        }
+        Err(e) => Err(tls_error(e))
+    }
+}

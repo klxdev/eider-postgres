@@ -1,0 +1,129 @@
+// Typed queries: rows into records (with renames, options, lists, times), parameters from records
+// and lists, and every kind of mismatch as a Decode error that names the column.
+
+import std.serial
+import std.time
+import postgres
+import postgres.client
+import postgres.typed
+import postgres.tests.util
+
+@[derive(Serialize, Deserialize)]
+type User = {
+    id: i64,
+    @[serial(name = "full_name")] name: String,
+    email: Option[String],
+    score: f64,
+    active: bool,
+    tags: List[String],
+    born: time.DateTime
+}
+
+@[derive(Serialize, Deserialize)]
+type Small = { id: i32, label: String }
+
+@[derive(Serialize, Deserialize), serial(unknown = "ignore")]
+type IdOnly = { id: i64 }
+
+@[derive(Serialize, Deserialize)]
+type Wrong = { id: String }
+
+@[derive(Serialize, Deserialize)]
+type NoNull = { id: i64, email: String }
+
+@[derive(Serialize, Deserialize)]
+type Missing = { id: i64, nope: i64 }
+
+@[derive(Serialize, Deserialize)]
+type Count = { n: i64 }
+
+@[derive(Serialize, Deserialize)]
+type Tiny = { n: u8 }
+
+@[derive(Deserialize)]
+type Mixed = { f: f64, n: f64, u: String, j: String, nu: String, d: time.DateTime, by: serial.Bytes, big: u64, arr: List[i64] }
+
+@[derive(Serialize, Deserialize)]
+type NewUser = { id: i64, full_name: String, email: Option[String], score: f64, active: bool, tags: List[String], born: time.DateTime }
+
+fn err(label: str, r: Result[List[Small], postgres.Error]) uses io {
+    match r {
+        Ok(rows) => print("{label}: ok {rows.len()} rows")
+        Err(e) => print("{label}: {e.kind}: {e.message}")
+    }
+}
+
+fn main() uses net, io, clock, fs {
+    let mut c = util.admin()
+    let dl = util.dl()
+    let z = c.execute("DROP TABLE IF EXISTS typed_test", dl).unwrap()
+    let z2 = c.execute("CREATE TABLE typed_test (id bigint PRIMARY KEY, full_name text NOT NULL, email text, score float8 NOT NULL, active bool NOT NULL, tags text[] NOT NULL, born timestamptz NOT NULL)", dl).unwrap()
+
+    // parameters from a record
+    let born = time.datetime(2026, 11, 5, 8, 30, 0, 0, 0).unwrap()
+    let ada = NewUser(1, String.from("Ada"), Some(String.from("ada@example.org")), 9.5, true, List[String.from("a"), String.from("b c")], born)
+    let bob = NewUser(2, String.from("Bob"), None, 3.25, false, List.new(), born)
+    let ins = "INSERT INTO typed_test (id, full_name, email, score, active, tags, born) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    print("insert ada: {typed.exec_with(inout c, ins, ada, dl).unwrap()}")
+    print("insert bob: {typed.exec_with(inout c, ins, bob, dl).unwrap()}")
+
+    // rows into records
+    let users = typed.query[User](inout c, "SELECT id, full_name, email, score, active, tags, born FROM typed_test ORDER BY id", List.new(), dl).unwrap()
+    for u in users { print("{u.id} {u.name} {u.email} {u.score} {u.active} {u.tags} {u.born.rfc3339()}") }
+    let one = typed.query_one[User](inout c, "SELECT * FROM typed_test WHERE id = $1", List[postgres.Int(2)], dl).unwrap()
+    print("query_one: {one.name} email {one.email}")
+    let none = typed.query_opt[User](inout c, "SELECT * FROM typed_test WHERE id = $1", List[postgres.Int(99)], dl).unwrap()
+    print("query_opt none: {none.is_none()}")
+    let some = typed.query_opt[IdOnly](inout c, "SELECT * FROM typed_test WHERE id = $1", List[postgres.Int(1)], dl).unwrap()
+    print("query_opt some with unknown=ignore: {some.unwrap().id}")
+    // parameters from a record and from a list
+    let by_rec = typed.query_with[IdOnly](inout c, "SELECT id FROM typed_test WHERE id = $1", IdOnly(2), dl).unwrap()
+    print("by record: {by_rec.len()} row, id {by_rec[0].id}")
+    let ids: List[i64] = List[1 as i64, 2 as i64]
+    let by_list = typed.query_with[IdOnly](inout c, "SELECT id FROM typed_test WHERE id = $1 OR id = $2 ORDER BY id", ids, dl).unwrap()
+    print("by list: {by_list.len()} rows")
+    let by_scalar = typed.query_with[IdOnly](inout c, "SELECT id FROM typed_test WHERE id = $1", 1 as i64, dl).unwrap()
+    print("by scalar: {by_scalar.len()} row")
+
+    // mismatches are typed errors that name the column
+    err("int8 value in range", typed.query[Small](inout c, "SELECT id, 'x'::text AS label FROM typed_test WHERE id = 1", List.new(), dl))
+    err("ok", typed.query[Small](inout c, "SELECT id::int AS id, 'x'::text AS label FROM typed_test", List.new(), dl))
+    err("missing column", typed.query[Small](inout c, "SELECT id::int AS id FROM typed_test", List.new(), dl))
+    err("unknown column", typed.query[Small](inout c, "SELECT id::int AS id, 'x'::text AS label, 1 AS extra FROM typed_test", List.new(), dl))
+    err("int8 into i32", typed.query[Small](inout c, "SELECT 4000000000::int8 AS id, 'x'::text AS label", List.new(), dl))
+    err("text into i32", typed.query[Small](inout c, "SELECT 'abc'::text AS id, 'x'::text AS label", List.new(), dl))
+    err("null into i32", typed.query[Small](inout c, "SELECT NULL::int AS id, 'x'::text AS label", List.new(), dl))
+    err("int into String", typed.query[Small](inout c, "SELECT 1::int AS id, 5::int AS label", List.new(), dl))
+    match typed.query[Wrong](inout c, "SELECT id FROM typed_test", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("Wrong: {e.message}")
+    }
+    match typed.query[NoNull](inout c, "SELECT id, email FROM typed_test ORDER BY id", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("NoNull: {e.message}")
+    }
+    match typed.query[Missing](inout c, "SELECT id FROM typed_test", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("Missing: {e.message}")
+    }
+    match typed.query[Tiny](inout c, "SELECT 300 AS n", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("Tiny: {e.message}")
+    }
+    match typed.query_one[Count](inout c, "SELECT count(*) AS n FROM typed_test", List.new(), dl) {
+        Ok(r) => print("count: {r.n}")
+        Err(e) => print("Count: {e.message}")
+    }
+    match typed.query_one[Count](inout c, "SELECT id AS n FROM typed_test", List.new(), dl) {
+        Ok(r) => print("no error?")
+        Err(e) => print("query_one with two rows: {e.kind} {e.message}")
+    }
+    // numbers, text and times of other column types
+    let mixed = typed.query_one[Mixed](inout c, "SELECT 1.5::float4 AS f, 2.50::numeric AS n, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid AS u, jsonb_build_object('k', 1) AS j, 12.30::numeric AS nu, '2026-01-02'::date AS d, decode('00ff','hex') AS by, 9::int8 AS big, ARRAY[3,4]::int8[] AS arr", List.new(), dl)
+    match mixed {
+        Ok(m) => print("mixed: {m.f} {m.n} {m.u} {m.j} {m.nu} {m.d.rfc3339()} {m.by.data} {m.big} {m.arr}")
+        Err(e) => print("mixed: {e.message}")
+    }
+    let z3 = c.execute("DROP TABLE typed_test", dl).unwrap()
+    c.close()
+}

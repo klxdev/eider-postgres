@@ -1,0 +1,142 @@
+// The type codecs without a server: binary and text forms of every supported type (cells written
+// by hand as PostgreSQL sends them), binary numerics, arrays, parameters, and cells that are wrong.
+
+import std.encoding
+import std.strings
+import std.time
+import postgres
+import postgres.codec
+import postgres.wire
+import postgres.tests.util
+
+fn be(bytes: List[u32]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for b in bytes { o.push(b as u8) }
+    o
+}
+
+fn show(label: str, r: Result[postgres.Value, postgres.Error]) uses io {
+    match r {
+        Ok(v) => print("{label}: {v}")
+        Err(e) => print("{label}: error {e.message}")
+    }
+}
+
+fn numeric(ndigits: i32, weight: i32, sign: u32, dscale: u32, digits: List[i32]) -> List[u8] {
+    let mut o = util.i16be(ndigits)
+    o.extend(util.i16be(weight))
+    o.extend(util.i16be(sign as i32))
+    o.extend(util.i16be(dscale as i32))
+    for d in digits { o.extend(util.i16be(d)) }
+    o
+}
+
+fn main() uses io {
+    print("integers")
+    show("int2 bin", codec.decode(21, true, be(List[255 as u32, 214])))
+    show("int4 bin", codec.decode(23, true, be(List[255 as u32, 255, 255, 249])))
+    show("int4 max", codec.decode(23, true, be(List[127 as u32, 255, 255, 255])))
+    show("int8 bin", codec.decode(20, true, be(List[128 as u32, 0, 0, 0, 0, 0, 0, 0])))
+    show("int8 text", codec.decode(20, false, "-9223372036854775808".bytes()))
+    show("int4 wrong size", codec.decode(23, true, be(List[1 as u32, 2])))
+    show("int2 text overflow", codec.decode(21, false, "99999999999999999999".bytes()))
+    show("int4 text junk", codec.decode(23, false, "12x".bytes()))
+    show("oid", codec.decode(26, true, be(List[255 as u32, 255, 255, 255])))
+    print("bool, floats")
+    show("bool t", codec.decode(16, true, be(List[1 as u32])))
+    show("bool bad", codec.decode(16, true, be(List[2 as u32])))
+    show("bool text", codec.decode(16, false, "f".bytes()))
+    show("bool text bad", codec.decode(16, false, "yes".bytes()))
+    show("float8 bin", codec.decode(701, true, be(List[64 as u32, 4, 0, 0, 0, 0, 0, 0])))
+    show("float4 bin", codec.decode(700, true, be(List[63 as u32, 192, 0, 0])))
+    show("float8 nan", codec.decode(701, true, be(List[127 as u32, 248, 0, 0, 0, 0, 0, 0])))
+    show("float8 -inf", codec.decode(701, true, be(List[255 as u32, 240, 0, 0, 0, 0, 0, 0])))
+    show("float8 text", codec.decode(701, false, "-1.5e-3".bytes()))
+    show("float8 Infinity text", codec.decode(701, false, "Infinity".bytes()))
+    show("float4 wrong size", codec.decode(700, true, be(List[1 as u32])))
+    print("text, bytea, uuid, json")
+    show("text", codec.decode(25, true, "héllo".bytes()))
+    show("varchar", codec.decode(1043, false, "x".bytes()))
+    show("text invalid utf-8", codec.decode(25, true, be(List[255 as u32, 254])))
+    show("bytea bin", codec.decode(17, true, be(List[0 as u32, 1, 255])))
+    show("bytea text", codec.decode(17, false, "\\x00ff10".bytes()))
+    show("bytea text odd", codec.decode(17, false, "\\x0".bytes()))
+    show("bytea text escape form", codec.decode(17, false, "abc".bytes()))
+    show("uuid bin", codec.decode(2950, true, be(List[160 as u32, 238, 188, 153, 156, 11, 78, 248, 187, 109, 107, 185, 189, 56, 10, 17])))
+    show("uuid wrong size", codec.decode(2950, true, be(List[1 as u32])))
+    show("json", codec.decode(114, false, "[1, 2]".bytes()))
+    show("jsonb bin", codec.decode(3802, true, be(List[1 as u32, 123, 125])))
+    show("jsonb bad version", codec.decode(3802, true, be(List[2 as u32, 123, 125])))
+    print("numeric")
+    show("12345.6789", codec.decode(1700, true, numeric(3, 1, 0, 4, List[1 as i32, 2345, 6789])))
+    show("-0.001", codec.decode(1700, true, numeric(1, -1, 16384, 3, List[10 as i32])))
+    show("0", codec.decode(1700, true, numeric(0, 0, 0, 0, List.new())))
+    show("0.00", codec.decode(1700, true, numeric(0, 0, 0, 2, List.new())))
+    show("10000", codec.decode(1700, true, numeric(1, 1, 0, 0, List[1 as i32])))
+    show("100000000.5", codec.decode(1700, true, numeric(4, 2, 0, 1, List[1 as i32, 0, 0, 5000])))
+    show("0.0000123", codec.decode(1700, true, numeric(1, -2, 0, 7, List[1230 as i32])))
+    show("NaN", codec.decode(1700, true, numeric(0, 0, 49152, 0, List.new())))
+    show("Infinity", codec.decode(1700, true, numeric(0, 0, 53248, 0, List.new())))
+    show("-Infinity", codec.decode(1700, true, numeric(0, 0, 61440, 0, List.new())))
+    show("bad digit", codec.decode(1700, true, numeric(1, 0, 0, 0, List[10000 as i32])))
+    show("negative digit", codec.decode(1700, true, numeric(1, 0, 0, 0, List[-1 as i32])))
+    show("bad sign", codec.decode(1700, true, numeric(0, 0, 4, 0, List.new())))
+    show("ndigits beyond the data", codec.decode(1700, true, numeric(5, 0, 0, 0, List[1 as i32])))
+    show("huge weight", codec.decode(1700, true, numeric(1, 16383, 0, 0, List[1 as i32])).map(|v| postgres.Null))
+    show("numeric text", codec.decode(1700, false, "12.50".bytes()))
+    print("dates and times")
+    show("date bin 2026-11-05", codec.decode(1082, true, be(List[0 as u32, 0, 38, 77])))
+    show("date bin 2000-01-01", codec.decode(1082, true, be(List[0 as u32, 0, 0, 0])))
+    show("date bin 1999-12-31", codec.decode(1082, true, be(List[255 as u32, 255, 255, 255])))
+    show("date infinity", codec.decode(1082, true, be(List[127 as u32, 255, 255, 255])))
+    show("date text", codec.decode(1082, false, "2026-02-29".bytes()))
+    show("timestamp bin epoch", codec.decode(1114, true, be(List[0 as u32, 0, 0, 0, 0, 0, 0, 0])))
+    show("timestamp bin negative", codec.decode(1114, true, be(List[255 as u32, 255, 255, 255, 255, 255, 255, 255])))
+    show("timestamptz bin", codec.decode(1184, true, be(List[0 as u32, 2, 144, 179, 128, 202, 78, 128])))
+    show("timestamp infinity", codec.decode(1114, true, be(List[127 as u32, 255, 255, 255, 255, 255, 255, 255])))
+    show("timestamp out of range", codec.decode(1114, true, be(List[100 as u32, 0, 0, 0, 0, 0, 0, 0])))
+    show("timestamp text", codec.decode(1114, false, "2026-11-05 13:45:01.123456".bytes()))
+    show("timestamp text no fraction", codec.decode(1114, false, "2026-11-05 13:45:01".bytes()))
+    show("timestamptz text +02", codec.decode(1184, false, "2026-11-05 13:45:01.5+02".bytes()))
+    show("timestamptz text -05:30", codec.decode(1184, false, "2026-11-05 13:45:01-05:30".bytes()))
+    show("timestamptz text bad", codec.decode(1184, false, "2026-13-05 13:45:01+00".bytes()))
+    show("timestamp BC", codec.decode(1114, false, "0044-03-15 12:00:00 BC".bytes()))
+    print("arrays and unknown types")
+    show("int4[]", codec.decode(1007, false, "{{1,2,NULL,4}}".bytes()))
+    show("empty", codec.decode(1007, false, "{{}}".bytes()))
+    show("text[]", codec.decode(1009, false, "{{a,\"b c\",\"q\\\"uote\",NULL,\"NULL\"}}".bytes()))
+    show("nested", codec.decode(1007, false, "{{{{1,2}},{{3,4}}}}".bytes()))
+    show("lower bounds", codec.decode(1007, false, "[2:3]={{7,8}}".bytes()))
+    show("bytea[]", codec.decode(1001, false, "{{\"\\\\x00ff\"}}".bytes()))
+    show("array unterminated", codec.decode(1007, false, "{{1,2".bytes()))
+    show("array junk", codec.decode(1007, false, "{{1,x}}".bytes()))
+    show("array empty element", codec.decode(1007, false, "{{1,,2}}".bytes()))
+    let mut deep = strings.repeat("{{", 40)
+    deep.push_str("1")
+    deep.append(strings.repeat("}}", 40))
+    show("array deep", codec.decode(1007, false, deep.bytes()))
+    show("unknown type text", codec.decode(1186, false, "1 day".bytes()))
+    show("unknown type binary", codec.decode(1186, true, be(List[1 as u32, 2])))
+    show("array binary is raw", codec.decode(1007, true, be(List[1 as u32])))
+    print("parameters")
+    for v in List[postgres.Null, postgres.Bool(true), postgres.Int(-5), postgres.Float(1.5), postgres.Float(1.0), postgres.Text(String.from("é")), postgres.Bytes(be(List[1 as u32, 2])), postgres.Numeric(String.from("1.50")), postgres.Uuid(String.from("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")), postgres.Json(String.from("[]"))] {
+        match codec.param(v) {
+            Ok(p) => print("  {v} -> oid {p.oid} binary {p.binary} data {p.data}")
+            Err(e) => print("  {v} -> error {e.message}")
+        }
+    }
+    let ts = time.datetime(2026, 11, 5, 13, 45, 1, 123456000, 120).unwrap()
+    print("date {codec.date_text(ts)} timestamp {codec.timestamp_text(ts, false)} timestamptz {codec.timestamp_text(ts, true)}")
+    print("negative offset {codec.timestamp_text(time.datetime(2026, 1, 2, 3, 4, 5, 0, -330).unwrap(), true)}")
+    print("floats: {codec.param(postgres.Float(0.0 / 0.0)).unwrap().data} {codec.param(postgres.Float(1.0 / 0.0)).unwrap().data} {codec.param(postgres.Float(-1.0 / 0.0)).unwrap().data}")
+    let arr = postgres.Array(List[postgres.Int(1), postgres.Null, postgres.Array(List[postgres.Text(String.from("a\"b\\c")), postgres.Bool(false), postgres.Float(2.5)])])
+    match codec.param(arr) {
+        Ok(p) => print("array -> {p.data.map(|d| d.len())} {String.from_bytes(p.data.unwrap_or(List.new())).unwrap()}")
+        Err(e) => print("array error {e.message}")
+    }
+    match codec.param(postgres.Array(List[postgres.Raw(1, false, List.new())])) {
+        Ok(p) => print("raw in an array accepted")
+        Err(e) => print("raw in an array: {e.kind}")
+    }
+    print("result formats: int4 {codec.result_binary(23)} text {codec.result_binary(25)} numeric {codec.result_binary(1700)} json {codec.result_binary(114)} timestamptz {codec.result_binary(1184)}")
+}

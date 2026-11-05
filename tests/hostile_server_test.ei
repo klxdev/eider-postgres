@@ -1,0 +1,225 @@
+// A client must survive a server that is broken or hostile: every scenario is a fake server on
+// the loopback interface that sends something wrong, and the client must answer with an error of
+// the right kind and never trap, hang past its deadline or run out of memory.
+
+import std.net
+import std.stream
+import std.strings
+import std.time
+import postgres
+import postgres.client
+import postgres.tests.util
+
+/// A fake server: accepts one connection, reads the client's startup, then sends the steps one
+/// after another, reading what the client sends in between (`pace` bytes per write, 0: all at
+/// once), and holds the connection open `hold_ms` before closing it.
+fn serve(l: i32, steps: List[List[u8]], pace: usize, hold_ms: i64) -> i32 uses net, io, clock {
+    let acc = match stream.accept_by(l, time.after_ms(5000)) {
+        Ok(a) => a
+        Err(e) => { return 1 }
+    }
+    let mut f = acc.fd.copy()
+    let first = f.read_by(4096, time.after_ms(5000))
+    let mut i: usize = 0
+    for step in steps {
+        if i > 0 {
+            let mut ok = true
+            let got = f.read_by(65536, time.after_ms(2000))
+        }
+        i += 1
+        if pace == 0 {
+            let w = stream.write_all_by(inout f, step, time.after_ms(5000))
+        } else {
+            let mut at: usize = 0
+            while at < step.len() {
+                let stop = if at + pace < step.len() { at + pace } else { step.len() }
+                let w = stream.write_all_by(inout f, step.slice(at, stop), time.after_ms(5000))
+                at = stop
+            }
+        }
+    }
+    if hold_ms > 0 { time.sleep_ms(hold_ms) }
+    let z = f.close()
+    0
+}
+
+fn outcome(name: str, r: Result[postgres.Rows, postgres.Error]) uses io {
+    match r {
+        Ok(rs) => print("{name}: ok, {rs.rows.len()} rows")
+        Err(e) => print("{name}: {e.kind}: {e.message}")
+    }
+}
+
+/// Runs one scenario: connects to a fake server with `steps`, then (when the connection comes up)
+/// runs one query.
+fn scenario(name: str, steps: List[List[u8]], pace: usize, hold_ms: i64, tweak: fn(postgres.Config) -> postgres.Config) uses net, io, clock, fs, threads {
+    let l = net.listener(net.ipv4(127, 0, 0, 1, 0), false).unwrap()
+    let addr = net.local_addr(l).unwrap()
+    let th = spawn(|| -> i32 { serve(l, steps, pace, hold_ms) })
+    var cfg = postgres.config("127.0.0.1", "u", "d")
+    cfg.port = addr.port
+    cfg.password = Some(String.from("pw"))
+    cfg.sslmode = postgres.Disable
+    cfg.cancel_grace_ms = 300
+    cfg = tweak(cfg)
+    let started = time.mono_ms()
+    match client.connect(cfg, time.after_ms(1500)) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            outcome(name, c.query("SELECT 1", List.new(), time.after_ms(1000)))
+            print("  usable afterwards: {c.usable()}")
+            c.close()
+        }
+        Err(e) => print("{name}: connect: {e.kind}: {e.message}")
+    }
+    let took = time.mono_ms() - started
+    if took > 4000 { print("  TOO SLOW: {took} ms") }
+    let r = th.join()
+    let z = stream.fd(l).close()
+}
+
+fn plain(c: postgres.Config) -> postgres.Config { c }
+
+fn one(m: List[u8]) -> List[List[u8]] {
+    let mut s: List[List[u8]] = List.new()
+    s.push(m)
+    s
+}
+
+fn two(a: List[u8], b: List[u8]) -> List[List[u8]] {
+    let mut s: List[List[u8]] = List.new()
+    s.push(a)
+    s.push(b)
+    s
+}
+
+fn three(a: List[u8], b: List[u8], c: List[u8]) -> List[List[u8]] {
+    let mut s: List[List[u8]] = List.new()
+    s.push(a)
+    s.push(b)
+    s.push(c)
+    s
+}
+
+fn cols1() -> List[(str, u32)] {
+    let mut c: List[(str, u32)] = List.new()
+    c.push(("n", 25))
+    c
+}
+
+fn main() uses net, io, clock, fs, threads {
+    let none: List[List[u8]] = List.new()
+    // --- at connect
+    scenario("closes at once", none, 0, 0, plain)
+    scenario("http instead of postgres", one("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".bytes()), 0, 200, plain)
+    scenario("length below 4", one(util.msg(90, List.new()).slice(0, 1)), 0, 0, plain)
+    let mut short: List[u8] = List.new()
+    short.push(90)
+    short.extend(util.i32be(3))
+    scenario("length 3", one(short), 0, 200, plain)
+    let mut huge: List[u8] = List.new()
+    huge.push(68)
+    huge.extend(util.i32be(-1))
+    scenario("length 0xFFFFFFFF", one(huge), 0, 200, plain)
+    let mut cut = util.auth(0)
+    scenario("truncated message", one(cut.slice(0, 6)), 0, 0, plain)
+    scenario("silent server", none, 0, 2500, plain)
+    scenario("unknown message type", one(util.msg(81, "x".bytes())), 0, 200, plain)
+    scenario("bad ReadyForQuery status", one(util.msg(90, "X".bytes())), 0, 200, plain)
+    scenario("ReadyForQuery with a body of 3", one(util.msg(90, "III".bytes())), 0, 200, plain)
+    scenario("backend key too short", one(util.msg(75, util.i32be(1))), 0, 200, plain)
+    scenario("md5 with a short salt", one(util.auth_with(5, "ab".bytes())), 0, 200, plain)
+    scenario("Kerberos", one(util.auth(2)), 0, 200, plain)
+    scenario("unknown authentication code", one(util.auth(99)), 0, 200, plain)
+    scenario("SASL without terminator", one(util.auth_with(10, "SCRAM-SHA-256".bytes())), 0, 200, plain)
+    let mut mech = util.cstr("SCRAM-SHA-256")
+    mech.push(0)
+    scenario("SASL with another mechanism", one(util.auth_with(10, util.cstr("PLAIN"))), 0, 200, plain)
+    scenario("SASL continue before start", one(util.auth_with(11, "r=x,s=AAAA,i=4096".bytes())), 0, 200, plain)
+    scenario("SASL final before start", one(util.auth_with(12, "v=AAAA".bytes())), 0, 200, plain)
+    scenario("AuthOk then an error response", one(util.error_response("28000", "no pg_hba.conf entry")), 0, 200, plain)
+    let mut two_auth = util.auth(0)
+    two_auth.extend(util.auth(0))
+    two_auth.extend(util.ready())
+    scenario("AuthOk twice", one(two_auth), 0, 200, plain)
+    scenario("SCRAM: AuthOk without the exchange", two(util.auth_with(10, mech), util.startup_ok()), 0, 200, plain)
+    let mut it = util.auth_with(11, "r=PLACEHOLDER,s=c2FsdA==,i=2147483647".bytes())
+    scenario("SCRAM: bad server-first", two(util.auth_with(10, mech), it), 0, 200, plain)
+
+    // --- after a good startup: the first query's answers
+    let ok = util.startup_ok()
+    scenario("startup only, then silence", one(ok), 0, 2500, plain)
+    scenario("unexpected BindComplete first", two(ok, util.msg(50, List.new())), 0, 200, plain)
+    scenario("parse answered with an error", two(ok, util.error_response("42601", "syntax error at or near \"SELEC\"")), 0, 200, plain)
+    let mut perr = util.error_response("42601", "syntax error")
+    perr.extend(util.ready())
+    scenario("error, then ReadyForQuery", two(ok, perr), 0, 200, plain)
+    let mut rd_lie = util.msg(84, util.i16be(1000))
+    scenario("RowDescription claims 1000 fields", two(ok, rd_lie), 0, 200, plain)
+    let mut rd_trunc = util.row_desc(cols1())
+    scenario("RowDescription cut short", two(ok, rd_trunc.slice(0, 12)), 0, 200, plain)
+    let mut bad_fmt = util.row_desc(cols1())
+    bad_fmt[bad_fmt.len() - 1] = 7
+    scenario("RowDescription with format code 7", two(ok, bad_fmt), 0, 200, plain)
+    let mut dr_many = util.msg(68, util.i16be(32767))
+    scenario("DataRow claims 32767 cells", three(ok, util.parsed(cols1()), dr_many), 0, 200, plain)
+    let mut dr_neg = util.i16be(1)
+    dr_neg.extend(util.i32be(-5))
+    scenario("DataRow with cell length -5", three(ok, util.parsed(cols1()), util.msg(68, dr_neg)), 0, 200, plain)
+    let mut dr_long = util.i16be(1)
+    dr_long.extend(util.i32be(1000000))
+    dr_long.extend("abc".bytes())
+    scenario("DataRow cell longer than the message", three(ok, util.parsed(cols1()), util.msg(68, dr_long)), 0, 200, plain)
+    let mut dr_trail = util.data_row(List[Some("a")])
+    dr_trail = util.msg(68, util.i16be(0).slice(0, 1))
+    scenario("DataRow cut inside the count", three(ok, util.parsed(cols1()), dr_trail), 0, 200, plain)
+    scenario("CommandComplete without NUL", three(ok, util.parsed(cols1()), util.msg(67, "SELECT 1".bytes())), 0, 200, plain)
+    let mut er_open = List[83 as u8, 69, 82, 82]
+    scenario("ErrorResponse without terminator", three(ok, util.parsed(cols1()), util.msg(69, er_open)), 0, 200, plain)
+    let mut two_cells = util.data_row(List[Some("a"), Some("b")])
+    two_cells.extend(util.command_complete("SELECT 1"))
+    two_cells.extend(util.ready())
+    scenario("DataRow with more cells than columns", three(ok, util.parsed(cols1()), two_cells), 0, 200, plain)
+    let mut good_result = util.data_row(List[Some("hello")])
+    good_result.extend(util.command_complete("SELECT 1"))
+    good_result.extend(util.msg(50, List.new()))
+    good_result.extend(util.ready())
+    let mut bind_first = util.msg(50, List.new())
+    bind_first.extend(util.data_row(List[Some("hello")]))
+    bind_first.extend(util.command_complete("SELECT 1"))
+    bind_first.extend(util.ready())
+    scenario("a good session", three(ok, util.parsed(cols1()), bind_first), 0, 200, plain)
+    scenario("a good session, one byte per write", three(ok, util.parsed(cols1()), bind_first), 1, 200, plain)
+    scenario("a good session, 7 bytes per write", three(ok, util.parsed(cols1()), bind_first), 7, 200, plain)
+
+    // --- floods
+    let mut flood = util.msg(50, List.new())
+    let row = util.data_row1(strings.repeat("x", 10000).bytes())
+    for i in 0..300 { flood.extend(row) }
+    flood.extend(util.command_complete("SELECT 300"))
+    flood.extend(util.ready())
+    scenario("result larger than max_result_bytes", three(ok, util.parsed(cols1()), flood), 0, 200, |c| -> postgres.Config {
+        var d = c.copy()
+        d.max_result_bytes = 100000
+        d
+    })
+    scenario("message larger than max_message", three(ok, util.parsed(cols1()), util.data_row1(strings.repeat("y", 5000).bytes())), 0, 200, |c| -> postgres.Config {
+        var d = c.copy()
+        d.max_message = 1000
+        d
+    })
+    // notices without end: valid ones are kept up to a bound, and the query goes on
+    let mut note = List[83 as u8]
+    note.extend(util.cstr("NOTICE"))
+    note.push(77)
+    note.extend(util.cstr("noise"))
+    note.push(0)
+    let noisy = util.msg(78, note)
+    let mut flood2 = util.msg(50, List.new())
+    for i in 0..500 { flood2.extend(noisy) }
+    flood2.extend(util.data_row(List[Some("hello")]))
+    flood2.extend(util.command_complete("SELECT 1"))
+    flood2.extend(util.ready())
+    scenario("500 notices before the result", three(ok, util.parsed(cols1()), flood2), 0, 200, plain)
+}
+

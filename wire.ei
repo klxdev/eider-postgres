@@ -1,0 +1,730 @@
+//! postgres.wire: the messages of the PostgreSQL frontend/backend protocol, version 3.0.
+//!
+//! The encoders build whole messages as bytes (a tag byte, a length that counts itself, the
+//! body). `decode(tag, body)` reads one backend message from the body of a frame; it checks
+//! every length against the bytes that are there, so a server that sends a short, oversized or
+//! garbled message gets an `Err(Protocol)` and never a trap. `frame` cuts the frames out of a
+//! byte buffer (`Framed`: a message, or "need more bytes", or an error for a length that is
+//! below 4 or above the limit).
+
+import std.bytes
+import std.encoding
+import std.utf8
+import postgres
+
+// ----------------------------------------------------------------------------------- reader
+
+/// A cursor on `b[i..end]`; every read past the end is None.
+pub type Rd = { b: List[u8], i: usize, end: usize }
+
+pub fn rd(b: List[u8]) -> Rd {
+    let n = b.len()
+    Rd(b, 0, n)
+}
+
+pub fn left(r: Rd) -> usize { r.end - r.i }
+
+pub fn get_u8(inout r: Rd) -> Option[u8] {
+    if r.i >= r.end { return None }
+    let v = r.b[r.i]
+    r.i += 1
+    Some(v)
+}
+
+pub fn get_u16(inout r: Rd) -> Option[u16] {
+    if r.end - r.i < 2 { return None }
+    let v = ((r.b[r.i] as u16) << 8) | (r.b[r.i + 1] as u16)
+    r.i += 2
+    Some(v)
+}
+
+pub fn get_i16(inout r: Rd) -> Option[i32] {
+    let v = get_u16(inout r)? as i32
+    if v >= 32768 { return Some(v - 65536) }
+    Some(v)
+}
+
+pub fn get_u32(inout r: Rd) -> Option[u32] {
+    if r.end - r.i < 4 { return None }
+    let v = ((r.b[r.i] as u32) << 24) | ((r.b[r.i + 1] as u32) << 16) | ((r.b[r.i + 2] as u32) << 8) | (r.b[r.i + 3] as u32)
+    r.i += 4
+    Some(v)
+}
+
+pub fn get_i32(inout r: Rd) -> Option[i32] {
+    let v = get_u32(inout r)?
+    Some(encoding.signed32(v))
+}
+
+/// The next `n` bytes, copied.
+pub fn get_bytes(inout r: Rd, n: usize) -> Option[List[u8]] {
+    if r.end - r.i < n { return None }
+    let out = r.b.slice(r.i, r.i + n)
+    r.i += n
+    Some(out)
+}
+
+/// A NUL-terminated string (without the NUL), as the bytes.
+pub fn get_cstr(inout r: Rd) -> Option[List[u8]] {
+    let mut k = r.i.copy()
+    while k < r.end {
+        if r.b[k] == 0 {
+            let out = r.b.slice(r.i, k)
+            r.i = k + 1
+            return Some(out)
+        }
+        k += 1
+    }
+    None
+}
+
+/// A NUL-terminated string as text (invalid UTF-8 becomes U+FFFD).
+pub fn get_text(inout r: Rd) -> Option[String] {
+    let b = get_cstr(inout r)?
+    Some(utf8.lossy(b))
+}
+
+pub fn rest(inout r: Rd) -> List[u8] {
+    let out = r.b.slice(r.i, r.end)
+    r.i = r.end
+    out
+}
+
+// ----------------------------------------------------------------------------------- writers
+
+fn put_i32(inout o: List[u8], v: i32) { encoding.push_i32_be(inout o, v) }
+
+fn put_u16(inout o: List[u8], v: u16) { encoding.push_u16_be(inout o, v) }
+
+fn put_cstr(inout o: List[u8], s: List[u8]) {
+    o.extend(s)
+    o.push(0)
+}
+
+/// Starts a message: the tag and a length to patch. Returns where the length is.
+fn begin(inout o: List[u8], tag: u8) -> usize {
+    o.push(tag)
+    let at = o.len()
+    o.push(0)
+    o.push(0)
+    o.push(0)
+    o.push(0)
+    at
+}
+
+/// Patches the length of the message `begin` started at `at`.
+fn end(inout o: List[u8], at: usize) {
+    let n = (o.len() - at) as u32
+    o[at] = ((n >> 24) & 255) as u8
+    o[at + 1] = ((n >> 16) & 255) as u8
+    o[at + 2] = ((n >> 8) & 255) as u8
+    o[at + 3] = (n & 255) as u8
+}
+
+/// The startup message: protocol 3.0, the user, the database and more parameters.
+pub fn startup(user: String, database: String, application_name: String, params: List[(String, String)]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(0)
+    o.push(0)
+    o.push(0)
+    o.push(0)
+    put_i32(inout o, 196608)
+    put_cstr(inout o, "user".bytes())
+    put_cstr(inout o, user.bytes())
+    if database.len() > 0 {
+        put_cstr(inout o, "database".bytes())
+        put_cstr(inout o, database.bytes())
+    }
+    if application_name.len() > 0 {
+        put_cstr(inout o, "application_name".bytes())
+        put_cstr(inout o, application_name.bytes())
+    }
+    put_cstr(inout o, "client_encoding".bytes())
+    put_cstr(inout o, "UTF8".bytes())
+    for p in params {
+        let (k, v) = p
+        put_cstr(inout o, k.bytes())
+        put_cstr(inout o, v.bytes())
+    }
+    o.push(0)
+    let n = o.len() as u32
+    o[0] = ((n >> 24) & 255) as u8
+    o[1] = ((n >> 16) & 255) as u8
+    o[2] = ((n >> 8) & 255) as u8
+    o[3] = (n & 255) as u8
+    o
+}
+
+/// SSLRequest: length 8 and the code 80877103.
+pub fn ssl_request() -> List[u8] {
+    let mut o: List[u8] = List.new()
+    put_i32(inout o, 8)
+    put_i32(inout o, 80877103)
+    o
+}
+
+/// CancelRequest for the backend `pid` with its secret key.
+pub fn cancel_request(pid: i32, secret: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    put_i32(inout o, (12 + secret.len()) as i32)
+    put_i32(inout o, 80877102)
+    put_i32(inout o, pid)
+    o.extend(secret)
+    o
+}
+
+/// PasswordMessage (cleartext or MD5 text).
+pub fn password(pw: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 112)
+    put_cstr(inout o, pw)
+    end(inout o, at)
+    o
+}
+
+/// SASLInitialResponse: the mechanism and the client-first message.
+pub fn sasl_initial(mech: str, data: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 112)
+    put_cstr(inout o, mech.bytes())
+    put_i32(inout o, data.len() as i32)
+    o.extend(data)
+    end(inout o, at)
+    o
+}
+
+/// SASLResponse.
+pub fn sasl_response(data: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 112)
+    o.extend(data)
+    end(inout o, at)
+    o
+}
+
+/// Query (simple protocol).
+pub fn query(sql: String) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 81)
+    put_cstr(inout o, sql.bytes())
+    end(inout o, at)
+    o
+}
+
+/// Parse: a statement `name` ("" is the unnamed one) from `sql`, with parameter types (0 lets the
+/// server infer one).
+pub fn parse(name: String, sql: String, oids: List[u32]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 80)
+    put_cstr(inout o, name.bytes())
+    put_cstr(inout o, sql.bytes())
+    put_u16(inout o, oids.len() as u16)
+    for t in oids { encoding.push_u32_be(inout o, t) }
+    end(inout o, at)
+    o
+}
+
+/// One bound parameter: None is NULL.
+pub type Param = { oid: u32, binary: bool, data: Option[List[u8]] }
+
+/// Bind: portal `portal` from statement `stmt` with the parameters (each in its own format) and
+/// the format of each result column (`result_formats` has one entry for all columns, or one
+/// per column; empty is text for all).
+pub fn bind(portal: String, stmt: String, params: List[Param], result_formats: List[u16]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 66)
+    put_cstr(inout o, portal.bytes())
+    put_cstr(inout o, stmt.bytes())
+    put_u16(inout o, params.len() as u16)
+    for p in params { put_u16(inout o, if p.binary { 1 } else { 0 }) }
+    put_u16(inout o, params.len() as u16)
+    for p in params {
+        match p.data {
+            Some(d) => {
+                put_i32(inout o, d.len() as i32)
+                o.extend(d)
+            }
+            None => { put_i32(inout o, -1) }
+        }
+    }
+    put_u16(inout o, result_formats.len() as u16)
+    for f in result_formats { put_u16(inout o, f) }
+    end(inout o, at)
+    o
+}
+
+/// Describe a statement (`kind` 83, 'S') or a portal (80, 'P').
+pub fn describe(kind: u8, name: String) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 68)
+    o.push(kind)
+    put_cstr(inout o, name.bytes())
+    end(inout o, at)
+    o
+}
+
+/// Execute a portal; `max_rows` 0 is no limit.
+pub fn execute(portal: String, max_rows: i32) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 69)
+    put_cstr(inout o, portal.bytes())
+    put_i32(inout o, max_rows)
+    end(inout o, at)
+    o
+}
+
+/// Close a statement (`kind` 83) or a portal (80).
+pub fn close(kind: u8, name: String) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 67)
+    o.push(kind)
+    put_cstr(inout o, name.bytes())
+    end(inout o, at)
+    o
+}
+
+fn bare(tag: u8) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(tag)
+    put_i32(inout o, 4)
+    o
+}
+
+pub fn sync() -> List[u8] { bare(83) }
+
+pub fn flush() -> List[u8] { bare(72) }
+
+pub fn terminate() -> List[u8] { bare(88) }
+
+pub fn copy_done() -> List[u8] { bare(99) }
+
+/// CopyData.
+pub fn copy_data(data: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 100)
+    o.extend(data)
+    end(inout o, at)
+    o
+}
+
+/// CopyFail with a message for the server's log.
+pub fn copy_fail(msg: String) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let at = begin(inout o, 102)
+    put_cstr(inout o, msg.bytes())
+    end(inout o, at)
+    o
+}
+
+// ----------------------------------------------------------------------------------- backend
+
+/// A column of a RowDescription.
+pub type Field = postgres.Column
+
+/// A message from the server.
+pub type Backend =
+    | AuthOk
+    | AuthKerberos
+    | AuthCleartext
+    | AuthMd5(salt: List[u8])
+    | AuthGss
+    | AuthSspi
+    | AuthSasl(mechanisms: List[String])
+    | AuthSaslContinue(data: List[u8])
+    | AuthSaslFinal(data: List[u8])
+    | AuthOther(code: i32)
+    | BackendKey(pid: i32, secret: List[u8])
+    | ParamStatus(name: String, value: String)
+    | Ready(status: u8)
+    | RowDesc(fields: List[postgres.Column])
+    | DataRow(cells: List[Option[List[u8]]])
+    | CmdComplete(tag: String)
+    | EmptyQuery
+    | ErrorResp(error: postgres.Error)
+    | NoticeResp(error: postgres.Error)
+    | ParseDone
+    | BindDone
+    | CloseDone
+    | NoData
+    | ParamDesc(oids: List[u32])
+    | Suspended
+    | Notify(pid: i32, channel: String, payload: String)
+    | CopyIn(binary: bool, formats: List[u16])
+    | CopyOut(binary: bool, formats: List[u16])
+    | CopyBoth(binary: bool, formats: List[u16])
+    | CopyData(data: List[u8])
+    | CopyDone
+    | Negotiate(version: u32, options: List[String])
+
+fn bad(what: str) -> postgres.Error {
+    let mut m = String.from("malformed ")
+    m.push_str(what)
+    m.push_str(" message from the server")
+    postgres.error(postgres.Protocol, m)
+}
+
+fn bad_len(what: str) -> postgres.Error {
+    let mut m = String.from(what)
+    m.push_str(" message from the server: length out of range")
+    postgres.error(postgres.Protocol, m)
+}
+
+/// The fields of an ErrorResponse or NoticeResponse.
+pub fn decode_error(body: List[u8], kind: postgres.Kind) -> Result[postgres.Error, postgres.Error] {
+    var e = postgres.error(kind, String.from(""))
+    let mut r = rd(body)
+    while true {
+        let code = match get_u8(inout r) {
+            Some(c) => c
+            None => { return Err(bad("ErrorResponse")) }
+        }
+        if code == 0 { break }
+        let v = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("ErrorResponse")) }
+        }
+        // S severity (V: untranslated, preferred), C code, M message, D detail, H hint, P position, p internal
+        // position, q internal query, W where, s schema, t table, c column, d data type, n constraint, F file, L line, R routine
+        if code == 83 { if e.severity.len() == 0 { e.severity = v } }
+        else if code == 86 { e.severity = v }
+        else if code == 67 { e.sqlstate = v }
+        else if code == 77 { e.message = v }
+        else if code == 68 { e.detail = v }
+        else if code == 72 { e.hint = v }
+        else if code == 80 { e.position = number(v) }
+        else if code == 112 { e.internal_position = number(v) }
+        else if code == 113 { e.internal_query = v }
+        else if code == 87 { e.context = v }
+        else if code == 115 { e.schema = v }
+        else if code == 116 { e.table = v }
+        else if code == 99 { e.column = v }
+        else if code == 100 { e.datatype = v }
+        else if code == 110 { e.constraint = v }
+        else if code == 70 { e.file = v }
+        else if code == 76 { e.line = v }
+        else if code == 82 { e.routine = v }
+    }
+    if e.message.len() == 0 { e.message = String.from("(no message)") }
+    Ok(e)
+}
+
+fn number(s: String) -> u32 {
+    let b = s.bytes()
+    if b.len() == 0 || b.len() > 9 { return 0 }
+    let mut n: u32 = 0
+    for c in b {
+        if c < 48 || c > 57 { return 0 }
+        n = n * 10 + ((c - 48) as u32)
+    }
+    n
+}
+
+fn decode_row_desc(body: List[u8]) -> Result[Backend, postgres.Error] {
+    let mut r = rd(body)
+    let n = match get_i16(inout r) {
+        Some(n) => n
+        None => { return Err(bad("RowDescription")) }
+    }
+    // a field is at least 19 bytes: a count that cannot fit is garbage
+    if n < 0 || (n as usize) * 19 > left(r) { return Err(bad_len("RowDescription")) }
+    let mut fields: List[postgres.Column] = List.new()
+    let mut i: i32 = 0
+    while i < n {
+        let name = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("RowDescription")) }
+        }
+        let table_oid = match get_u32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        let attnum = match get_i16(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        let type_oid = match get_u32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        let type_size = match get_i16(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        let type_mod = match get_i32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        let format = match get_u16(inout r) {
+            Some(v) => v
+            None => { return Err(bad("RowDescription")) }
+        }
+        if format > 1 { return Err(bad("RowDescription")) }
+        fields.push(postgres.Column(name, table_oid, attnum, type_oid, type_size, type_mod, format))
+        i += 1
+    }
+    if left(r) != 0 { return Err(bad("RowDescription")) }
+    Ok(RowDesc(fields))
+}
+
+fn decode_data_row(body: List[u8]) -> Result[Backend, postgres.Error] {
+    let mut r = rd(body)
+    let n = match get_i16(inout r) {
+        Some(n) => n
+        None => { return Err(bad("DataRow")) }
+    }
+    // a cell is at least its 4-byte length
+    if n < 0 || (n as usize) * 4 > left(r) { return Err(bad_len("DataRow")) }
+    let mut cells: List[Option[List[u8]]] = List.new()
+    let mut i: i32 = 0
+    while i < n {
+        let len = match get_i32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("DataRow")) }
+        }
+        if len == -1 {
+            cells.push(None)
+        } else {
+            if len < 0 || (len as usize) > left(r) { return Err(bad_len("DataRow")) }
+            match get_bytes(inout r, len as usize) {
+                Some(b) => { cells.push(Some(b)) }
+                None => { return Err(bad("DataRow")) }
+            }
+        }
+        i += 1
+    }
+    if left(r) != 0 { return Err(bad("DataRow")) }
+    Ok(DataRow(cells))
+}
+
+fn decode_copy_response(body: List[u8], what: str) -> Result[(bool, List[u16]), postgres.Error] {
+    let mut r = rd(body)
+    let overall = match get_u8(inout r) {
+        Some(v) => v
+        None => { return Err(bad(what)) }
+    }
+    let n = match get_i16(inout r) {
+        Some(v) => v
+        None => { return Err(bad(what)) }
+    }
+    if overall > 1 || n < 0 || (n as usize) * 2 != left(r) { return Err(bad(what)) }
+    let mut fs: List[u16] = List.new()
+    let mut i: i32 = 0
+    while i < n {
+        match get_u16(inout r) {
+            Some(f) => { fs.push(f) }
+            None => { return Err(bad(what)) }
+        }
+        i += 1
+    }
+    Ok((overall == 1, fs))
+}
+
+fn decode_auth(body: List[u8]) -> Result[Backend, postgres.Error] {
+    let mut r = rd(body)
+    let code = match get_i32(inout r) {
+        Some(c) => c
+        None => { return Err(bad("Authentication")) }
+    }
+    if code == 0 { return Ok(AuthOk) }
+    if code == 2 { return Ok(AuthKerberos) }
+    if code == 3 { return Ok(AuthCleartext) }
+    if code == 5 {
+        match get_bytes(inout r, 4) {
+            Some(s) => { return Ok(AuthMd5(s)) }
+            None => { return Err(bad("Authentication")) }
+        }
+    }
+    if code == 7 { return Ok(AuthGss) }
+    if code == 9 { return Ok(AuthSspi) }
+    if code == 10 {
+        let mut ms: List[String] = List.new()
+        while true {
+            let m = match get_cstr(inout r) {
+                Some(m) => m
+                None => { return Err(bad("Authentication")) }
+            }
+            if m.len() == 0 { break }
+            ms.push(utf8.lossy(m))
+        }
+        return Ok(AuthSasl(ms))
+    }
+    if code == 11 { return Ok(AuthSaslContinue(rest(inout r))) }
+    if code == 12 { return Ok(AuthSaslFinal(rest(inout r))) }
+    Ok(AuthOther(code))
+}
+
+/// Reads the backend message `tag` with this body.
+pub fn decode(tag: u8, body: List[u8]) -> Result[Backend, postgres.Error] {
+    let mut r = rd(body)
+    if tag == 82 { return decode_auth(body) }
+    if tag == 90 {
+        // ReadyForQuery
+        if body.len() != 1 { return Err(bad("ReadyForQuery")) }
+        let s = body[0]
+        if s != 73 && s != 84 && s != 69 { return Err(bad("ReadyForQuery")) }
+        return Ok(Ready(s))
+    }
+    if tag == 84 { return decode_row_desc(body) }
+    if tag == 68 { return decode_data_row(body) }
+    if tag == 67 {
+        let t = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("CommandComplete")) }
+        }
+        if left(r) != 0 { return Err(bad("CommandComplete")) }
+        return Ok(CmdComplete(t))
+    }
+    if tag == 69 {
+        let e = decode_error(body, postgres.Server)?
+        return Ok(ErrorResp(e))
+    }
+    if tag == 78 {
+        let e = decode_error(body, postgres.Server)?
+        return Ok(NoticeResp(e))
+    }
+    if tag == 83 {
+        let n = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("ParameterStatus")) }
+        }
+        let v = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("ParameterStatus")) }
+        }
+        if left(r) != 0 { return Err(bad("ParameterStatus")) }
+        return Ok(ParamStatus(n, v))
+    }
+    if tag == 75 {
+        // BackendKeyData: the process id and a secret of 4 to 256 bytes
+        let pid = match get_i32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("BackendKeyData")) }
+        }
+        let n = left(r)
+        if n < 4 || n > 256 { return Err(bad("BackendKeyData")) }
+        return Ok(BackendKey(pid, rest(inout r)))
+    }
+    if tag == 73 {
+        if body.len() != 0 { return Err(bad("EmptyQueryResponse")) }
+        return Ok(EmptyQuery)
+    }
+    if tag == 49 {
+        if body.len() != 0 { return Err(bad("ParseComplete")) }
+        return Ok(ParseDone)
+    }
+    if tag == 50 {
+        if body.len() != 0 { return Err(bad("BindComplete")) }
+        return Ok(BindDone)
+    }
+    if tag == 51 {
+        if body.len() != 0 { return Err(bad("CloseComplete")) }
+        return Ok(CloseDone)
+    }
+    if tag == 110 {
+        if body.len() != 0 { return Err(bad("NoData")) }
+        return Ok(NoData)
+    }
+    if tag == 115 {
+        if body.len() != 0 { return Err(bad("PortalSuspended")) }
+        return Ok(Suspended)
+    }
+    if tag == 116 {
+        let n = match get_i16(inout r) {
+            Some(v) => v
+            None => { return Err(bad("ParameterDescription")) }
+        }
+        if n < 0 || (n as usize) * 4 != left(r) { return Err(bad("ParameterDescription")) }
+        let mut oids: List[u32] = List.new()
+        let mut i: i32 = 0
+        while i < n {
+            match get_u32(inout r) {
+                Some(o) => { oids.push(o) }
+                None => { return Err(bad("ParameterDescription")) }
+            }
+            i += 1
+        }
+        return Ok(ParamDesc(oids))
+    }
+    if tag == 65 {
+        let pid = match get_i32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("NotificationResponse")) }
+        }
+        let ch = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("NotificationResponse")) }
+        }
+        let pl = match get_text(inout r) {
+            Some(t) => t
+            None => { return Err(bad("NotificationResponse")) }
+        }
+        if left(r) != 0 { return Err(bad("NotificationResponse")) }
+        return Ok(Notify(pid, ch, pl))
+    }
+    if tag == 71 {
+        let (b, f) = decode_copy_response(body, "CopyInResponse")?
+        return Ok(CopyIn(b, f))
+    }
+    if tag == 72 {
+        let (b, f) = decode_copy_response(body, "CopyOutResponse")?
+        return Ok(CopyOut(b, f))
+    }
+    if tag == 87 {
+        let (b, f) = decode_copy_response(body, "CopyBothResponse")?
+        return Ok(CopyBoth(b, f))
+    }
+    if tag == 100 { return Ok(CopyData(body)) }
+    if tag == 99 {
+        if body.len() != 0 { return Err(bad("CopyDone")) }
+        return Ok(CopyDone)
+    }
+    if tag == 118 {
+        let v = match get_u32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("NegotiateProtocolVersion")) }
+        }
+        let n = match get_u32(inout r) {
+            Some(v) => v
+            None => { return Err(bad("NegotiateProtocolVersion")) }
+        }
+        if (n as usize) > left(r) { return Err(bad("NegotiateProtocolVersion")) }
+        let mut opts: List[String] = List.new()
+        let mut i: u32 = 0
+        while i < n {
+            match get_text(inout r) {
+                Some(t) => { opts.push(t) }
+                None => { return Err(bad("NegotiateProtocolVersion")) }
+            }
+            i += 1
+        }
+        return Ok(Negotiate(v, opts))
+    }
+    let mut m = String.from("unknown message type ")
+    m.append(String.from_int(tag as i64))
+    m.push_str(" from the server")
+    Err(postgres.error(postgres.Protocol, m))
+}
+
+/// The result of cutting a frame out of a buffer.
+pub type Framed =
+    | NeedMore(missing: usize)
+    | Frame(tag: u8, body: List[u8], used: usize)
+    | BadFrame(error: postgres.Error)
+
+/// Cuts the frame that starts at `buf[at]`: a tag, a length that counts itself and the body.
+/// `max` bounds the body: a longer frame is rejected before any of it is read.
+pub fn frame(buf: List[u8], at: usize, max: usize) -> Framed {
+    let have = buf.len() - at
+    if have < 5 { return NeedMore(5 - have) }
+    let tag = buf[at]
+    let len = ((buf[at + 1] as u32) << 24) | ((buf[at + 2] as u32) << 16) | ((buf[at + 3] as u32) << 8) | (buf[at + 4] as u32)
+    if len < 4 {
+        return BadFrame(postgres.error(postgres.Protocol, String.from("message length below 4")))
+    }
+    let body_len = (len - 4) as usize
+    if body_len > max {
+        return BadFrame(postgres.error(postgres.Protocol, String.from("message from the server is longer than the limit")))
+    }
+    if have < 5 + body_len { return NeedMore(5 + body_len - have) }
+    Frame(tag, buf.slice(at + 5, at + 5 + body_len), 5 + body_len)
+}

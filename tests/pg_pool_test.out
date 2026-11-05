@@ -1,0 +1,15 @@
+made: max 3 open 1 idle 1
+distinct connections used by 12 tasks: true, none failed: true
+after: open true opened true in use 0
+server sees at most 3: true
+exhausted: Timeout
+served in order: 0 1 2 3 4 
+idle connection replaced: true
+fresh one reused: true
+dead connection replaced: true
+trap: Closed
+pool still works after a trap: true
+rolled back on release: Int(0)
+reused connection is clean: true
+closed pool: Usage
+done

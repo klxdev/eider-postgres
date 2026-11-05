@@ -1,0 +1,162 @@
+// Helpers shared by the tests: where the server is and who to be (integration tests), and builders
+// of backend messages for the fake servers of the hostile-server tests.
+
+import std.encoding
+import std.env
+import std.strings
+import std.time
+import postgres
+import postgres.client
+
+pub fn port() -> i32 uses io {
+    match env.get("EIDER_PG_PORT".bytes()) {
+        Some(p) => {
+            match String.from_bytes(p) {
+                Ok(s) => strings.parse_i32(s).unwrap_or(55432)
+                Err(_) => 55432
+            }
+        }
+        None => 55432
+    }
+}
+
+pub fn config(user: str, password: str) -> postgres.Config uses io {
+    var cfg = postgres.config("127.0.0.1", user, "eiderdb")
+    cfg.port = port()
+    cfg.password = Some(String.from(password))
+    cfg.sslmode = postgres.Disable
+    cfg
+}
+
+pub fn dl() -> time.Deadline uses clock { time.after_ms(20000) }
+
+/// A connection as the superuser, or a trap with the error.
+pub fn admin() -> client.Conn uses net, io, clock, fs {
+    match client.connect(config("eider", "eider_pw"), dl()) {
+        Ok(c) => c
+        Err(e) => panic("cannot connect: {postgres.error_text(e)}")
+    }
+}
+
+// ---- backend messages for fake servers
+
+/// A message: tag, length (counting itself) and body.
+pub fn msg(tag: u8, body: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(tag)
+    encoding.push_i32_be(inout o, (body.len() + 4) as i32)
+    o.extend(body)
+    o
+}
+
+pub fn cstr(s: str) -> List[u8] {
+    let mut o = s.bytes()
+    o.push(0)
+    o
+}
+
+pub fn i32be(v: i32) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    encoding.push_i32_be(inout o, v)
+    o
+}
+
+pub fn i16be(v: i32) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(((v >> 8) & 255) as u8)
+    o.push((v & 255) as u8)
+    o
+}
+
+pub fn auth(code: i32) -> List[u8] { msg(82, i32be(code)) }
+
+pub fn auth_with(code: i32, rest: List[u8]) -> List[u8] {
+    let mut b = i32be(code)
+    b.extend(rest)
+    msg(82, b)
+}
+
+pub fn ready() -> List[u8] { msg(90, "I".bytes()) }
+
+pub fn param_status(k: str, v: str) -> List[u8] {
+    let mut b = cstr(k)
+    b.extend(cstr(v))
+    msg(83, b)
+}
+
+pub fn backend_key(pid: i32, secret: i32) -> List[u8] {
+    let mut b = i32be(pid)
+    b.extend(i32be(secret))
+    msg(75, b)
+}
+
+/// AuthenticationOk, a parameter, the backend key and ReadyForQuery.
+pub fn startup_ok() -> List[u8] {
+    let mut o = auth(0)
+    o.extend(param_status("server_version", "17.0 (fake)"))
+    o.extend(backend_key(4242, 99))
+    o.extend(ready())
+    o
+}
+
+/// RowDescription for columns of `(name, type oid)`, all text format.
+pub fn row_desc(cols: List[(str, u32)]) -> List[u8] {
+    let mut b = i16be(cols.len() as i32)
+    for c in cols {
+        let (n, oid) = c
+        b.extend(cstr(n))
+        b.extend(i32be(0))
+        b.extend(i16be(0))
+        encoding.push_u32_be(inout b, oid)
+        b.extend(i16be(-1))
+        b.extend(i32be(-1))
+        b.extend(i16be(0))
+    }
+    msg(84, b)
+}
+
+pub fn data_row(cells: List[Option[str]]) -> List[u8] {
+    let mut b = i16be(cells.len() as i32)
+    for c in cells {
+        match c {
+            Some(s) => {
+                b.extend(i32be(s.len() as i32))
+                b.extend(s.bytes())
+            }
+            None => { b.extend(i32be(-1)) }
+        }
+    }
+    msg(68, b)
+}
+
+pub fn command_complete(tag: str) -> List[u8] { msg(67, cstr(tag)) }
+
+/// A DataRow with one cell.
+pub fn data_row1(cell: List[u8]) -> List[u8] {
+    let mut b = i16be(1)
+    b.extend(i32be(cell.len() as i32))
+    b.extend(cell)
+    msg(68, b)
+}
+
+pub fn error_response(code: str, message: str) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    b.push(83)
+    b.extend(cstr("ERROR"))
+    b.push(67)
+    b.extend(cstr(code))
+    b.push(77)
+    b.extend(cstr(message))
+    b.push(0)
+    msg(69, b)
+}
+
+/// ParseComplete, ParameterDescription (none), NoData / RowDescription, ReadyForQuery: what the
+/// server answers to Parse + Describe + Sync.
+pub fn parsed(cols: List[(str, u32)]) -> List[u8] {
+    let mut o = msg(49, List.new())
+    o.extend(msg(116, i16be(0)))
+    if cols.len() == 0 { o.extend(msg(110, List.new())) } else { o.extend(row_desc(cols)) }
+    o.extend(ready())
+    o
+}
