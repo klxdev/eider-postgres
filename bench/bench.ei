@@ -25,10 +25,10 @@ fn port() -> i32 uses io {
 fn rate(count: i64, ms: i64) -> i64 { if ms <= 0 { 0 } else { count * 1000 / ms } }
 
 fn main() uses net, io, clock, fs, threads {
-    var count: i64 = 5000
+    let mut count: i64 = 5000
     let args = env.args()
     if args.len() > 1 { count = strings.parse_i64(String.from_bytes(args[1]).unwrap()).unwrap_or(5000) }
-    var cfg = postgres.config("127.0.0.1", "eider", "eiderdb")
+    let mut cfg = postgres.config("127.0.0.1", "eider", "eiderdb")
     cfg.port = port()
     cfg.password = Some(String.from("eider_pw"))
     cfg.sslmode = postgres.Disable
@@ -77,7 +77,7 @@ fn main() uses net, io, clock, fs, threads {
     c.close()
 
     // the pool: tasks sharing 4 connections
-    var pc = pool.pool_config()
+    let mut pc = pool.pool_config()
     pc.max = 4
     let p = pool.new(cfg, pc, dl).unwrap()
     let per: i64 = count / 4

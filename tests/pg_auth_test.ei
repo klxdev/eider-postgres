@@ -7,7 +7,7 @@ import postgres.codec
 import postgres.tests.util
 
 fn who(user: str, password: Option[String]) uses net, io, clock, fs {
-    var cfg = util.config(user, "x")
+    let mut cfg = util.config(user, "x")
     cfg.password = password
     match client.connect(cfg, util.dl()) {
         Ok(c0) => {
@@ -39,20 +39,20 @@ fn main() uses net, io, clock, fs {
     who("scram_user", Some(String.from("")))
 
     // a database that does not exist
-    var cfg = util.config("eider", "eider_pw")
+    let mut cfg = util.config("eider", "eider_pw")
     cfg.database = String.from("no_such_db")
     match client.connect(cfg, util.dl()) {
         Ok(c) => print("connected to a missing database?")
         Err(e) => print("missing database: {e.kind} {e.sqlstate}")
     }
     // nothing listens there: refused, and a name that does not resolve
-    var dead = util.config("eider", "eider_pw")
+    let mut dead = util.config("eider", "eider_pw")
     dead.port = 1
     match client.connect(dead, util.dl()) {
         Ok(c) => print("connected to port 1?")
         Err(e) => print("refused: {e.kind}")
     }
-    var nowhere = util.config("eider", "eider_pw")
+    let mut nowhere = util.config("eider", "eider_pw")
     nowhere.host = String.from("no-such-host.invalid")
     match client.connect(nowhere, util.dl()) {
         Ok(c) => print("resolved?")
@@ -60,7 +60,7 @@ fn main() uses net, io, clock, fs {
     }
 
     // this server has no TLS: prefer goes on in clear text, require and verify-full refuse
-    var pref = util.config("eider", "eider_pw")
+    let mut pref = util.config("eider", "eider_pw")
     pref.sslmode = postgres.Prefer
     match client.connect(pref, util.dl()) {
         Ok(c0) => {
@@ -71,7 +71,7 @@ fn main() uses net, io, clock, fs {
         Err(e) => print("prefer: {e.kind} {e.message}")
     }
     for mode in List[postgres.Require, postgres.VerifyFull] {
-        var need = util.config("eider", "eider_pw")
+        let mut need = util.config("eider", "eider_pw")
         need.sslmode = mode
         match client.connect(need, util.dl()) {
             Ok(c) => print("{mode} connected without TLS?")
@@ -80,7 +80,7 @@ fn main() uses net, io, clock, fs {
     }
 
     // startup parameters reach the server
-    var cfg2 = util.config("eider", "eider_pw")
+    let mut cfg2 = util.config("eider", "eider_pw")
     cfg2.application_name = String.from("eider-pg-test-app")
     cfg2.params.push((String.from("search_path"), String.from("pg_catalog")))
     let mut c = client.connect(cfg2, util.dl()).unwrap()

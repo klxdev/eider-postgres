@@ -21,7 +21,7 @@ pub fn port() -> i32 uses io {
 }
 
 pub fn config(user: str, password: str) -> postgres.Config uses io {
-    var cfg = postgres.config("127.0.0.1", user, "eiderdb")
+    let mut cfg = postgres.config("127.0.0.1", user, "eiderdb")
     cfg.port = port()
     cfg.password = Some(String.from(password))
     cfg.sslmode = postgres.Disable

@@ -371,7 +371,7 @@ fn bad_len(what: str) -> postgres.Error {
 
 /// The fields of an ErrorResponse or NoticeResponse.
 pub fn decode_error(body: List[u8], kind: postgres.Kind) -> Result[postgres.Error, postgres.Error] {
-    var e = postgres.error(kind, String.from(""))
+    let mut e = postgres.error(kind, String.from(""))
     let mut r = rd(body)
     while true {
         let code = match get_u8(inout r) {

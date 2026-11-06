@@ -206,7 +206,7 @@ pub fn discard(p: Pool, l: Lease) uses net, io, clock, fs {
 }
 
 fn trap_error(m: String) -> postgres.Error {
-    var e = postgres.fail(postgres.Closed, "the function trapped; its connection was closed and the server rolls back its transaction")
+    let mut e = postgres.fail(postgres.Closed, "the function trapped; its connection was closed and the server rolls back its transaction")
     e.detail = m
     e
 }

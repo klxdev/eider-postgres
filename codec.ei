@@ -614,8 +614,8 @@ pub fn value(rs: postgres.Rows, r: usize, c: usize) -> Result[postgres.Value, po
     match decode_cell(col.type_oid, col.format == 1, cell) {
         Ok(v) => Ok(v)
         Err(e) => {
-            var pe = e.copy()
-            var m = String.from("column ")
+            let mut pe = e.copy()
+            let mut m = String.from("column ")
             m.append(col.name.copy())
             m.push_str(": ")
             m.append(e.message.copy())
@@ -630,7 +630,7 @@ pub fn get(rs: postgres.Rows, r: usize, name: str) -> Result[postgres.Value, pos
     match rs.column_index(name) {
         Some(c) => value(rs, r, c)
         None => {
-            var m = String.from("no column named ")
+            let mut m = String.from("no column named ")
             m.append(String.from(name))
             Err(dfail_text(m))
         }

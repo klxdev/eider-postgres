@@ -361,7 +361,7 @@ pub fn parse_url(url: str) -> Result[Config, Error] {
     }
     if port < 1 || port > 65535 { return Err(bad_url("the port must be 1 to 65535")) }
     if host.len() == 0 { host = String.from("127.0.0.1") }
-    var cfg = config("x", "x", "x")
+    let mut cfg = config("x", "x", "x")
     cfg.host = host
     cfg.port = port
     cfg.user = user

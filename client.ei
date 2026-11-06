@@ -72,7 +72,7 @@ fn closed_error() -> postgres.Error {
 }
 
 fn new_conn(link: secure.Link, addr: net.Addr, cfg: postgres.Config) -> Conn {
-    var c = cfg.copy()
+    let mut c = cfg.copy()
     // the password is not kept: nothing needs it after the handshake
     Conn(link, addr, c, List.new(), 0, 0, List.new(), 73, READY, Map.new(), Map.new(), List.new(), 1, List.new(), List.new(), List.new(), 0)
 }
@@ -367,7 +367,7 @@ impl Conn {
                     return Ok(())
                 }
                 wire.ErrorResp(e) => {
-                    var err = e.copy()
+                    let mut err = e.copy()
                     if e.class() == String.from("28") { err.kind = postgres.Auth }
                     self.state = BROKEN
                     return Err(err)
@@ -580,7 +580,7 @@ impl Conn {
         }
         let mut fcols: List[postgres.Column] = List.new()
         for c in cols {
-            var d = c.copy()
+            let mut d = c.copy()
             d.format = if codec.result_binary(c.type_oid) { 1 } else { 0 }
             fcols.push(d)
         }
@@ -979,7 +979,7 @@ pub fn connect(cfg: postgres.Config, dl: time.Deadline) -> Result[Conn, postgres
 // ----------------------------------------------------------------------------- transactions
 
 fn trap_error(m: String) -> postgres.Error {
-    var e = postgres.fail(postgres.Closed, "the function trapped; the connection was closed and the server rolls the transaction back")
+    let mut e = postgres.fail(postgres.Closed, "the function trapped; the connection was closed and the server rolls the transaction back")
     e.detail = m
     e
 }

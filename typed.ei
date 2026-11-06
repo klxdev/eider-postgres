@@ -245,8 +245,8 @@ pub fn decode_rows[T: serial.Deserialize](rs: postgres.Rows) -> Result[List[T], 
         match T.deserialize(row_reader(rs.columns, rs.rows[i])) {
             Ok(x) => { out.push(x) }
             Err(e) => {
-                var pe = decode_error(e)
-                var m = String.from("row ")
+                let mut pe = decode_error(e)
+                let mut m = String.from("row ")
                 m.append(String.from_int(i as i64))
                 m.push_str(": ")
                 m.append(pe.message.copy())

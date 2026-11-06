@@ -165,7 +165,7 @@ pub fn upgrade(inout l: Link, cfg: postgres.Config, dl: time.Deadline) -> Result
             }
         }
     }
-    var tc = config.client_config("localhost", roots)
+    let mut tc = config.client_config("localhost", roots)
     tc.server_name = Some(cfg.host.bytes())
     if !verify { tc.verify = config.Insecure }
     tc.now = cfg.tls_now

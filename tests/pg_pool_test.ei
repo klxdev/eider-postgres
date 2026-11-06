@@ -18,7 +18,7 @@ fn pid_of(inout c: client.Conn) -> Result[i64, postgres.Error] uses net, io, clo
 }
 
 fn config() -> postgres.Config uses io {
-    var cfg = util.config("eider", "eider_pw")
+    let mut cfg = util.config("eider", "eider_pw")
     cfg.application_name = String.from("eider-pool-test")
     cfg
 }
@@ -28,7 +28,7 @@ fn main() uses net, io, clock, fs, threads {
     let mut admin = util.admin()
 
     // many tasks, three connections
-    var pc = pool.pool_config()
+    let mut pc = pool.pool_config()
     pc.min = 1
     pc.max = 3
     let p = pool.new(config(), pc, dl).unwrap()
@@ -63,7 +63,7 @@ fn main() uses net, io, clock, fs, threads {
     print("server sees at most 3: {server_side <= 3}")
 
     // exhaustion: one connection, held
-    var pc1 = pool.pool_config()
+    let mut pc1 = pool.pool_config()
     pc1.max = 1
     let one = pool.new(config(), pc1, dl).unwrap()
     let held = pool.acquire(one, dl).unwrap()
@@ -98,7 +98,7 @@ fn main() uses net, io, clock, fs, threads {
     print("served in order: {served}")
 
     // idle timeout: a connection idle too long is replaced
-    var pc2 = pool.pool_config()
+    let mut pc2 = pool.pool_config()
     pc2.max = 2
     pc2.idle_timeout_ms = 200
     let idle = pool.new(config(), pc2, dl).unwrap()
@@ -110,7 +110,7 @@ fn main() uses net, io, clock, fs, threads {
     print("fresh one reused: {again == second_pid}")
 
     // health check: the server kills the idle connection; the next checkout notices
-    var pc3 = pool.pool_config()
+    let mut pc3 = pool.pool_config()
     pc3.max = 1
     pc3.check_after_idle_ms = 0
     let hc = pool.new(config(), pc3, dl).unwrap()
@@ -135,7 +135,7 @@ fn main() uses net, io, clock, fs, threads {
     // a connection returned in a transaction is rolled back
     let z = admin.execute("DROP TABLE IF EXISTS pool_test", dl).unwrap()
     let z2 = admin.execute("CREATE TABLE pool_test (id int)", dl).unwrap()
-    var l = pool.acquire(hc, dl).unwrap()
+    let mut l = pool.acquire(hc, dl).unwrap()
     l.conn.begin(dl).unwrap()
     let ins = l.conn.exec("INSERT INTO pool_test VALUES (1)", List.new(), dl).unwrap()
     pool.release(hc, l)

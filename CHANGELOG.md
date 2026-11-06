@@ -3,6 +3,10 @@
 eider-postgres's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- Use `let mut` instead of the removed `var` (eider-lang#2).
+
 ## 0.7.0
 
 First version, for Eider 0.7: a PostgreSQL client in Eider. Protocol v3 with cleartext, MD5 and

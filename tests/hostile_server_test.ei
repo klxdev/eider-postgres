@@ -56,7 +56,7 @@ fn scenario(name: str, steps: List[List[u8]], pace: usize, hold_ms: i64, tweak: 
     let l = net.listener(net.ipv4(127, 0, 0, 1, 0), false).unwrap()
     let addr = net.local_addr(l).unwrap()
     let th = spawn(|| -> i32 { serve(l, steps, pace, hold_ms) })
-    var cfg = postgres.config("127.0.0.1", "u", "d")
+    let mut cfg = postgres.config("127.0.0.1", "u", "d")
     cfg.port = addr.port
     cfg.password = Some(String.from("pw"))
     cfg.sslmode = postgres.Disable
@@ -199,12 +199,12 @@ fn main() uses net, io, clock, fs, threads {
     flood.extend(util.command_complete("SELECT 300"))
     flood.extend(util.ready())
     scenario("result larger than max_result_bytes", three(ok, util.parsed(cols1()), flood), 0, 200, |c| -> postgres.Config {
-        var d = c.copy()
+        let mut d = c.copy()
         d.max_result_bytes = 100000
         d
     })
     scenario("message larger than max_message", three(ok, util.parsed(cols1()), util.data_row1(strings.repeat("y", 5000).bytes())), 0, 200, |c| -> postgres.Config {
-        var d = c.copy()
+        let mut d = c.copy()
         d.max_message = 1000
         d
     })

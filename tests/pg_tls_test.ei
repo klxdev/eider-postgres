@@ -17,7 +17,7 @@ fn root(name: str) -> List[u8] uses fs {
 }
 
 fn try_mode(label: str, mode: postgres.SslMode, host: str, roots: Option[List[u8]], now: Option[i64]) uses net, io, clock, fs {
-    var cfg = util.config("eider", "eider_pw")
+    let mut cfg = util.config("eider", "eider_pw")
     cfg.sslmode = mode
     cfg.host = String.from(host)
     cfg.root_cert = roots
@@ -52,7 +52,7 @@ fn main() uses net, io, clock, fs, threads {
     try_mode("verify-full, a bad root file", postgres.VerifyFull, "127.0.0.1", Some("not pem".bytes()), None)
 
     // a session over TLS
-    var cfg = util.config("eider", "eider_pw")
+    let mut cfg = util.config("eider", "eider_pw")
     cfg.sslmode = postgres.VerifyFull
     cfg.root_cert = Some(ca.copy())
     let mut c = client.connect(cfg, util.dl()).unwrap()
@@ -75,7 +75,7 @@ fn main() uses net, io, clock, fs, threads {
     c.close()
 
     // the pool over TLS, from several tasks
-    var pc = pool.pool_config()
+    let mut pc = pool.pool_config()
     pc.max = 3
     let p = pool.new(cfg, pc, util.dl()).unwrap()
     let mut tasks: List[Task[i64]] = List.new()

@@ -129,7 +129,7 @@ fn main() uses net, io, clock, fs {
     print("wide: {wv == want}")
 
     // the result size limit
-    var cfg = util.config("eider", "eider_pw")
+    let mut cfg = util.config("eider", "eider_pw")
     cfg.max_result_bytes = 1000
     let mut small = client.connect(cfg, dl).unwrap()
     match small.query("SELECT repeat('x', 5000)", List.new(), dl) {
