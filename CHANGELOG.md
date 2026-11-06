@@ -3,7 +3,7 @@
 eider-postgres's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.1
 
 - Use `let mut` instead of the removed `var` (eider-lang#2).
 
