@@ -3,7 +3,7 @@
 eider-postgres's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.2
 
 - Consumable through git (eider-lang#222): crypto is the toolchain's own package (`[deps.crypto] toolchain = true`,
   Eider 0.7.6 and later) and eider-tls a git dependency, instead of path dependencies on links into `target/deps`.

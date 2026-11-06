@@ -1,6 +1,6 @@
 [package]
 name = "postgres"
-version = "0.7.1"
+version = "0.7.2"
 eider = "0.7"
 description = "A PostgreSQL client in Eider: wire protocol v3 (SCRAM-SHA-256, MD5, simple and extended queries, prepared statements, transactions, COPY, LISTEN/NOTIFY, cancellation), TLS, a bounded connection pool and typed queries from records (docs/postgres.md)"
 
@@ -14,5 +14,5 @@ uses = ["io"]
 # A release of eider-tls whose own crypto dependency is the toolchain's (its changelog).
 [deps.tls]
 git = "https://github.com/klxdev/eider-tls.git"
-version = "0.7.1"
+version = "0.7.2"
 uses = ["net", "io", "clock", "fs"]
