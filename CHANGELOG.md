@@ -3,7 +3,7 @@
 eider-postgres's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.0
 
 First version, for Eider 0.7: a PostgreSQL client in Eider. Protocol v3 with cleartext, MD5 and
 SCRAM-SHA-256 authentication; simple and extended queries with a prepared-statement cache; text and binary
