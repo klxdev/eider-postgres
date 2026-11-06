@@ -26,8 +26,10 @@ TLS through eider-tls (`postgres.secure`, `sslmode=require` or `verify-full`). S
 
 Limits: no Kerberos/GSS/SSPI; passwords are not SASLprep'd; results are read whole (bounded by
 `max_result_bytes`); arrays decode from text form only; interval, time, inet and similar come back as `Raw`.
-The dependencies on eider-tls and crypto are path dependencies (`target/deps`), so this package is not yet
-consumable through git.
+Use it as a git dependency (`[deps.postgres]`, `git = "https://github.com/klxdev/eider-postgres.git"`) together with
+`[deps.crypto]` set to `toolchain = true` (crypto comes with Eider 0.7.6 and later; eider-tls is fetched from its
+repository). An installed toolchain is enough to build and test it; `ASAN=1 sh scripts/test.sh` needs an eider-lang
+checkout (it builds the crypto backend sanitized).
 
 Scripts: `scripts/test.sh` (codec and hostile-server tests always; server tests when podman and a postgres
 image are present; `PG_VERSIONS="16 17 18"`), `scripts/bench.sh`, `scripts/pg-up.sh`, `scripts/pg-down.sh`.
