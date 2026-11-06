@@ -104,6 +104,11 @@ else
   done
 fi
 
+# the sanitized crypto backend is built by an eider-lang checkout's scripts/crypto-build.sh
+if [ -n "$ASAN" ] && [ ! -f "$toolchain/scripts/crypto-build.sh" ]; then
+  echo "skip asan runs: $toolchain is an installed toolchain (the sanitized crypto backend needs an eider-lang checkout: EIDER_TOOLCHAIN=...)"
+  ASAN=
+fi
 if [ -n "$ASAN" ]; then
   for f in $NOSERVER; do
     if ! (EIDER_CACHE=off EIDER_CRYPTO_SAN=1 EIDER_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"; export EIDER_CACHE EIDER_CRYPTO_SAN EIDER_CFLAGS; ei build "$f" -o "$T/a") > "$T/log" 2>&1; then

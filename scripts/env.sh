@@ -26,7 +26,7 @@
 # $toolchain/.vendor/<name> (fetched there and hash-checked by its scripts/vendor.sh on first
 # use). A dependency with none of these is fetched from its repository (network).
 # DEPS: the git packages in this repository's dependency graph (transitive ones included).
-DEPS=""
+DEPS="tls"
 
 die() { echo "$(basename "$0"): $*" >&2; exit 2; }
 install_hint="install eider (gh release download --repo klxdev/eider-lang --pattern install.sh && sh install.sh --toolchain; eider-lang's docs/site/tooling/eider.md), or set EIDER_TOOLCHAIN to an Eider toolchain or an eider-lang checkout"
@@ -90,21 +90,6 @@ for d in $DEPS; do
 done
 export EIDER_PKG_OVERRIDE
 
-# Until the crypto package has a repository of its own, and eider-tls (which builds on it) can
-# be a dependency fetched from its repository (eider-pkg refuses a package from a repository
-# that has a path dependency), both are path dependencies here, linked into target/deps:
-#   target/deps/tls                    -> $EIDER_TLS, else ../eider-tls (a checkout of it)
-#   target/deps/tls/target/deps/crypto -> $toolchain/packages/crypto
-# crypto goes through tls's own link because eider-pkg refuses two different packages named
-# `crypto` (eider-tls's scripts/env.sh sets that link the same way). eider.toml's [deps.crypto]
-# and [deps.tls] name these paths.
-tls_dir=${EIDER_TLS:-$here/../eider-tls}
-[ -f "$tls_dir/eider.toml" ] || die "no eider-tls checkout at $tls_dir (set EIDER_TLS): it is a path dependency until the crypto package is published"
-tls_dir=$(cd "$tls_dir" && pwd -P)
-if [ -d "$toolchain/packages/crypto" ]; then
-  mkdir -p "$here/target/deps" "$tls_dir/target/deps"
-  ln -sfn "$tls_dir" "$here/target/deps/tls"
-  ln -sfn "$toolchain/packages/crypto" "$tls_dir/target/deps/crypto"
-else
-  die "$toolchain has no packages/crypto: eider-postgres needs an eider-lang checkout as its toolchain (EIDER_TOOLCHAIN) until the crypto package is published"
-fi
+# crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
+# and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"
