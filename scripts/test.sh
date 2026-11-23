@@ -49,8 +49,9 @@ run() { # <test>: run with eider and compare
 tsan_ok=
 tsan_probe() {
   if [ -z "$tsan_ok" ]; then
-    printf 'int main(void) { return 0; }\n' > "$T/probe.c"
-    if ${CC:-cc} -fsanitize=thread -o "$T/probe" "$T/probe.c" 2>/dev/null && "$T/probe"; then tsan_ok=yes; else tsan_ok=no; fi
+    # (the probe uses longjmp, which traps rely on: a TSan that cannot follow it, as on glibc 2.4x, is skipped)
+  printf '#include <setjmp.h>\nstatic jmp_buf j;\nstatic void jump(void) { longjmp(j, 1); }\nint main(void) { if (setjmp(j) == 0) jump(); return 0; }\n' > "$T/probe.c"
+    if ${CC:-cc} -fsanitize=thread -o "$T/probe" "$T/probe.c" 2>/dev/null && "$T/probe" >/dev/null 2>&1; then tsan_ok=yes; else tsan_ok=no; fi
   fi
   [ "$tsan_ok" = yes ]
 }
