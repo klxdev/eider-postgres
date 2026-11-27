@@ -3,6 +3,10 @@
 eider-postgres's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.8.0
+
+For Eider 0.8: the version and the `eider` series move to 0.8 with the toolchain; no source changes.
+
 ## 0.7.3
 
 For Eider 0.7.10. No library change. The tests skip their ThreadSanitizer runs when TSan cannot follow `longjmp` (glibc 2.4x), as they do for a missing runtime.

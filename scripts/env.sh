@@ -92,4 +92,4 @@ export EIDER_PKG_OVERRIDE
 
 # crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
 # and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
-[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.8\`)"
